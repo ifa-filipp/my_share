@@ -1,0 +1,2045 @@
+import streamlit as st
+import numpy as np
+import pandas as pd
+import polars as pl
+import warnings
+import os
+import re
+import datetime
+from datetime import timedelta
+from datetime import date
+from scipy import stats
+import sys
+import random
+import time
+import uuid
+from io import BytesIO
+from scipy.stats import chi2_contingency, fisher_exact
+from scipy.stats import ttest_ind
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import Font, Border, Side  
+from scipy.stats import mannwhitneyu
+from joblib import Parallel, delayed
+from prefect_sqlalchemy import SqlAlchemyConnector
+import tempfile
+import io
+import shutil
+import soundfile as sf
+from moviepy import AudioFileClip
+import logging
+from prefect.logging import get_run_logger
+from prefect_aws.s3 import S3Bucket
+from pathlib import Path
+import nltk
+from typing import List
+from prefect.deployments import run_deployment
+import plotly.graph_objects as go
+from openpyxl.utils import get_column_letter
+import duckdb
+
+
+from openpyxl.styles import Alignment
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+import json
+
+from custom_libs.user_activity_logging import action
+
+
+st.set_page_config(# page_title="Сервис транскрибации", 
+                       layout="wide") 
+
+if 'session_uid' not in st.session_state:
+    st.session_state['session_uid'] = str(uuid.uuid4())
+
+warnings.filterwarnings("ignore")
+warnings.simplefilter("ignore", UserWarning)
+
+PRODUCT_KEYWORDS = {
+    "Соглашение расчетно-кассового обслуживания": [],
+    "Договор гарантии": [],
+    "Соглашение обеспечения": [],
+    "Зарплатный проект": [],
+    "Кредитный продукт": [],
+    "Аккредитив": [],
+    "Депозит": [],
+    "Соглашение эквайринга": []
+}
+
+search_help = """
+Для поиска используйте:<br>
+- <b>и</b> — все слова (напр.: <code>привет и спасибо</code>)<br>
+- <b>или</b> — хотя бы одно (напр.: <code>ошибка или сбой</code>)<br>
+- <b>скобки ()</b> — группировка (напр.: <code>(привет или здравствуйте) и спасибо</code>)<br>
+- <b>просто слова через пробел</b> — автоматически как "и" (напр.: <code>добрый день</code>)<br>
+<br>
+* по умолчанию поиск по всему диалогу
+"""
+
+TYPE_LABELS = {
+    0: '0 - К - клиент',
+    1: '1 - С - сотрудник',
+}
+
+extra_help = "Клиентский опыт"
+
+def clean_value(val):
+    if val is None or val == "None":
+        return ""
+    return str(val).strip()
+
+def safe_search_mask(series: pl.Series, search_text: str) -> pl.Series:
+    if not search_text or not search_text.strip():
+        return pl.Series([True] * len(series))
+    expr = search_text.strip().lower()
+    try:
+        groups = {}
+        def replace_group(match):
+            gid = f"__G{len(groups)}__"
+            groups[gid] = match.group(1).lower()
+            return gid
+        expr_proc = re.sub(r'\(([^)]+)\)', replace_group, expr)
+        expr_proc = expr_proc.replace(' и ', ' & ').replace(' или ', ' | ')
+        for gid, subexpr in groups.items():
+            subexpr = subexpr.replace(' и ', ' & ').replace(' или ', ' | ')
+            expr_proc = expr_proc.replace(gid, f"({subexpr})")
+        atom_pattern = r"[^&|()]+"
+        atoms = [a.strip() for a in re.findall(atom_pattern, expr_proc) if a.strip()]
+        atoms = list(dict.fromkeys(atoms))
+        local_vars = {}
+        for i, atom in enumerate(atoms):
+            var_name = f"term_{i}"
+            phrase = atom.replace('&', '').replace('|', '').strip()
+            if not phrase:
+                local_vars[var_name] = pl.Series([True] * len(series))
+            else:
+                # Use (?i) flag for case-insensitive matching in Polars regex
+                mask = series.str.contains(f"(?i){re.escape(phrase)}", literal=False).fill_null(False)
+                local_vars[var_name] = mask
+            expr_proc = expr_proc.replace(atom, var_name)
+        local_vars['&'] = lambda a, b: a & b
+        local_vars['|'] = lambda a, b: a | b
+        mask = eval(expr_proc, {"__builtins__": {}}, local_vars)
+        return mask if isinstance(mask, pl.Series) else pl.Series([bool(mask)] * len(series))
+    except Exception:
+        words = expr.split()
+        if not words:
+            return pl.Series([True] * len(series))
+        mask = pl.Series([True] * len(series))
+        for word in words:
+            w = word.strip()
+            if w:
+                # Use (?i) flag for case-insensitive matching in Polars regex
+                mask &= series.str.contains(f"(?i){re.escape(w)}", literal=False).fill_null(False)
+        return mask
+
+def filter_dialog_by_type_codes(dialog: str, type_codes: list[int]) -> str:
+    """
+    Извлекает из диалога только сообщения указанных типов.
+    
+    Формат диалога:
+        "K - (1.5s – 4.6s) - текст сообщения...\nC - (5.0s – 17.7s) - текст..."
+    
+    Маппинг кодов → букв в диалоге:
+        0 → 'K' (клиент)
+        1 → 'C' (сотрудник)
+    
+    Возвращает строку с отфильтрованными сообщениями (или пустую строку).
+    """
+    if not dialog or not isinstance(dialog, str):
+        return ""
+    
+    # Маппинг: код типа → буква в начале сообщения
+    code_to_letter = {0: 'K', 1: 'C'}
+    target_letters = {code_to_letter[c] for c in type_codes if c in code_to_letter}
+    
+    if not target_letters:
+        return ""
+    
+    # 🔧 ИСПРАВЛЕНИЕ: используем findall вместо split для надёжного парсинга
+    # Паттерн захватывает ВСЁ сообщение целиком: буква + время + текст до следующего сообщения или конца
+    pattern = r'([CK])\s*-\s*\([^)]+\)\s*-\s*[^K\n]*(?=(?:\n?[CK]\s*-\s*\(|$))'
+    
+    matches = re.findall(pattern, dialog, re.DOTALL)
+    
+    # re.findall с группами возвращает кортежи, если есть группы захвата
+    # Поэтому используем другой подход: ищем полные блоки
+    pattern_full = r'([CK])\s*-\s*\([^)]+\)\s*-\s*(.*?)(?=\n?[CK]\s*-\s*\(|$)'
+    
+    filtered_parts = []
+    for match in re.finditer(pattern_full, dialog, re.DOTALL):
+        speaker = match.group(1)  # 'K' или 'C'
+        text = match.group(2).strip()  # текст сообщения
+        full_msg = match.group(0).strip()  # полное сообщение
+        
+        if speaker in target_letters:
+            filtered_parts.append(full_msg)
+    
+    return '\n'.join(filtered_parts) if filtered_parts else ""
+        
+# --- График ---  
+def build_chart(df: pl.DataFrame, visible_chat_ids: list, date_range: tuple):
+    df = df.to_pandas()
+    start_date, end_date = date_range
+    if not isinstance(start_date, date):
+        start_date = start_date.date()
+    if not isinstance(end_date, date):
+        end_date = end_date.date()
+    df = df[(df['ddate'].dt.date >= start_date) & (df['ddate'].dt.date <= end_date)].copy()
+    visible_df = df[df['id'].isin(visible_chat_ids)].copy()
+    all_df = df.copy()
+    visible_df['week'] = pd.to_datetime(visible_df['ddate']).dt.to_period('W-SUN').astype(str)
+    all_df['week'] = pd.to_datetime(all_df['ddate']).dt.to_period('W-SUN').astype(str)
+    weekly_visible = visible_df.groupby('week')['id'].nunique()
+    weekly_all = all_df.groupby('week')['id'].nunique()
+    date_series = pd.date_range(start=start_date, end=end_date, freq='D')
+    all_weeks = pd.Series(date_series).dt.to_period('W-SUN').astype(str).unique()
+    weekly_visible = weekly_visible.reindex(all_weeks, fill_value=0)
+    weekly_all = weekly_all.reindex(all_weeks, fill_value=0)
+    merged = pd.DataFrame({
+        'week': all_weeks,
+        'count': weekly_visible.values,
+        'total_count': weekly_all.values
+    })
+    merged['share'] = merged.apply(
+        lambda row: round((row['count'] / row['total_count']) * 100, 2) if row['total_count'] > 0 else 0,
+        axis=1
+    )
+    merged['week_label'] = merged['week'].apply(lambda w: f"Неделя {pd.Period(w).start_time.isocalendar()[1]}")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=merged['week_label'],
+        y=merged['count'],
+        name='Количество диалогов',
+        mode='lines+markers',
+        line=dict(color='#99FF99', width=2.5),
+        marker=dict(size=6, color='#99FF99', line=dict(width=1, color='white')),
+        yaxis='y',
+        hovertemplate=(
+            'Количество диалогов: %{y}'
+            '<extra></extra>'
+        )
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=merged['week_label'],
+        y=merged['share'],
+        name='Доля от всех диалогов, %',
+        mode='lines+markers',
+        line=dict(color='#FF9999', width=2.5),
+        marker=dict(size=6, color='#FF9999', line=dict(width=1, color='white')),
+        yaxis='y2',
+        hovertemplate=(
+            'Доля от всех диалогов: %{y:.2f}%'
+            '<extra></extra>'
+        )
+    ))
+
+    # Единый цвет сетки — полупрозрачный серый
+    grid_color = 'rgba(0, 0, 0, 0.1)'
+
+    fig.update_layout(
+        title=dict(
+        text="Динамика диалогов",
+        font=dict(size=14, color='#777'),  # умеренный размер
+        x=0.5,               # центрирование
+        xanchor='center'
+    ),
+        xaxis=dict(
+            showgrid=True,
+            gridcolor=grid_color,
+            gridwidth=1,
+            zeroline=False,
+            title_standoff=10
+        ),
+        yaxis=dict(
+            title="Количество диалогов",
+            side="left",
+            showgrid=False,          # ← ВКЛЮЧЕНО
+            gridcolor=grid_color,   # ← ПОЛУПРОЗРАЧНАЯ
+            gridwidth=1,
+            zeroline=False,
+            title_standoff=10
+        ),
+        yaxis2=dict(
+            title="Доля, %",
+            overlaying="y",
+            side="right",
+            showgrid=True,          # ← ВКЛЮЧЕНО (для второй оси тоже!)
+            gridcolor=grid_color,   # ← та же сетка
+            gridwidth=1,
+            range=[0, 100],
+            title_standoff=10
+        ),
+        
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            bgcolor='rgba(255,255,255,0.8)',
+            font=dict(size=11)
+        ),
+        height=350,
+        margin=dict(l=60, r=60, t=30, b=60),
+        hovermode="x unified",
+        plot_bgcolor='white',
+        paper_bgcolor='white'
+    )
+    fig.update_xaxes(showline=True, linewidth=1, linecolor='rgba(0,0,0,0.2)')
+    fig.update_yaxes(showline=True, linewidth=1, linecolor='rgba(0,0,0,0.2)')
+    return fig
+
+
+
+def get_trigrams(s: str):
+    s = " " + s.strip().lower() + " "  # граничные маркеры улучшают качество
+    return {s[i:i+3] for i in range(len(s) - 2)}
+
+def jaccard_similarity(set1, set2):
+    if not set1 and not set2:
+        return 1.0
+    intersection = len(set1 & set2)
+    union = len(set1 | set2)
+    return intersection / union
+
+def fuzzy_trigram_match(text_series: pl.Series, query_word: str, threshold=0.8) -> pl.Series:
+    """
+    Performs fuzzy matching using trigram Jaccard similarity against    Returns a boolean Series indicating matches.
+    """
+    query_trigrams = get_trigrams(query_word)
+
+    def match_cell(cell_value):
+        if cell_value is None:
+            return False
+        # Split the string into words and check each one
+        words = str(cell_value).split()
+        for w in words:
+            if jaccard_similarity(query_trigrams, get_trigrams(w)) >= threshold:
+                return True
+        return False
+
+    # Use map_elements to apply the custom function to each element in the Series
+    return text_series.map_elements(match_cell, return_dtype=pl.Boolean)
+
+def apply_sql_dialog_filter(df: pl.DataFrame, sql_where: str) -> pl.DataFrame:
+    """Применяет SQL-условие к Polars DataFrame через DuckDB"""
+    if not sql_where or not sql_where.strip():
+        return df
+    try:
+        con = duckdb.connect()
+        # Регистрируем датафрейм под именем 'transcripts' для SQL
+        con.register("transcripts", df)
+        
+        # Формируем запрос. Если пользователь ввёл только условие WHERE, оборачиваем его
+        sql_clean = sql_where.strip()
+        if sql_clean.upper().startswith("SELECT"):
+            query = sql_clean
+        else:
+            query = f"SELECT * FROM transcripts WHERE {sql_clean}"
+            
+        # Выполняем запрос и возвращаем результат обратно в Polars
+        result_df = con.execute(query).pl()
+        return result_df
+    except Exception as e:
+        st.error(f"⚠️ Ошибка в SQL-условии: {str(e)}")
+        # Возвращаем пустой DF, чтобы таблица не показывала некорректные данные
+        return df.filter(pl.lit(False))
+        
+def apply_filters_logic(full_df: pl.DataFrame, filters_dict: dict):
+    """Применяет фильтры и возвращает отфильтрованный датафрейм и список чатов"""
+
+    # Копируем датафрейм (Polars не мутирует оригинальный DataFrame, так что копия не нужна)
+    filtered_df = full_df.clone()
+
+    # Фильтр по дате
+    s, e = filters_dict['date_actual']
+    if not isinstance(s, date):
+        s = s.date()
+    if not isinstance(e, date):
+        e = e.date()
+    filtered_df = filtered_df.filter(
+        (pl.col('ddate').dt.date() >= s) &
+        (pl.col('ddate').dt.date() <= e)
+    )
+
+    # Фильтр по id
+    if filters_dict.get('audio'):
+        audio_values = [str(x) for x in filters_dict['audio']]
+        filtered_df = filtered_df.filter(pl.col('id').cast(pl.Utf8).is_in(audio_values))
+        
+    # Фильтр по phone
+    if filters_dict.get('phone'):
+        phone_values = [str(x) for x in filters_dict['phone']]
+        filtered_df = filtered_df.filter(pl.col('phone').cast(pl.Utf8).is_in(phone_values))
+
+    # Фильтр по inn (client)
+    if filters_dict.get('client'):
+        filtered_df = filtered_df.filter(pl.col('inn').is_in(filters_dict['client']))
+
+    # Фильтр по inn (direction)
+    if filters_dict.get('direction'):
+        filtered_df = filtered_df.filter(pl.col('direction').is_in(filters_dict['direction']))
+
+    # Фильтр по employeename (manager)
+    if filters_dict.get('manager'):
+        # Создаем список условий: содержит ли столбец каждое из выбранных имен
+        # literal=True важен, чтобы точки в ФИО не воспринимались как спецсимволы regex
+        conditions = [
+            pl.col('employeename').str.contains(name, literal=True) 
+            for name in filters_dict['manager']
+        ]
+        
+        # Объединяем условия через ИЛИ (если выбрано несколько менеджеров, 
+        # покажет строки, где есть хоть кто-то из списка)
+        filtered_df = filtered_df.filter(pl.any_horizontal(conditions))
+
+    # Фильтр по contact_id
+    if filters_dict.get('contact_id'):
+        contact_id_values = [str(x) for x in filters_dict['contact_id']]
+        filtered_df = filtered_df.filter(pl.col('contact_id').cast(pl.Utf8).is_in(contact_id_values))
+
+    # # Фильтр по emotion
+    # if filters_dict.get('emotion'):
+    #     filtered_df = filtered_df.filter(pl.col('has_emotion').cast(pl.Utf8).is_in(filters_dict['emotion']))
+    
+
+    # Доп фильтры
+    chat_ids_to_keep = set(filtered_df.select(pl.col('id')).to_series().to_list())
+    
+    if "Диалог с эмоциональной окраской со стороны клиента" in filters_dict.get('extra', []):
+        emotional_ids = set(
+            filtered_df
+            .filter(pl.col('has_emotion') == 1)
+            .select('id')
+            .unique()
+            .to_series()
+            .to_list()
+        )
+        chat_ids_to_keep &= emotional_ids  # Пересечение множеств
+    if "Тематика обращений 1.1" in filters_dict.get('extra', []):
+        theme_1_1s = filters_dict.get('theme_1_1', [])
+        theme_1_1_ids = set(
+            filtered_df
+            .filter(pl.col('theme_1_1').is_in(theme_1_1s))
+            .select('id') 
+            .unique()
+            .to_series()
+            .to_list()
+        )
+        chat_ids_to_keep &= theme_1_1_ids  # Пересечение множеств
+    if "Тематика обращений 1.2" in filters_dict.get('extra', []):
+        theme_1_2s = filters_dict.get('theme_1_2', [])
+        theme_1_2_ids = set(
+            filtered_df
+            .filter(pl.col('theme_1_2').is_in(theme_1_2s))
+            .select('id')
+            .unique()
+            .to_series()
+            .to_list()
+        )
+        chat_ids_to_keep &= theme_1_2_ids  # Пересечение множеств
+
+    if "Вежливость со стороны сотрудника" in filters_dict.get('extra', []):
+        polite_ids = set(
+            filtered_df
+            .filter(pl.col('employee_politeness') == True)
+            .select('id')
+            .unique()
+            .to_series()
+            .to_list()
+        ) 
+        
+        include = filters_dict.get('polite_employee_include', True)
+        # 3. Фильтрация множеств
+        if include:
+            chat_ids_to_keep &= polite_ids
+        else:
+            chat_ids_to_keep -= polite_ids
+
+    # === Фильтр "Обращение по имени" (4 независимых условия) ===
+    if "Обращение по имени" in filters_dict.get('extra', []):
+        name_asked = filters_dict.get('name_asked', 'Любой')
+        name_provided = filters_dict.get('name_provided', 'Любой')
+        name_used = filters_dict.get('name_used', 'Любой')
+        name_used_3plus = filters_dict.get('name_used_3plus', 'Любой')
+        required_cols = [
+            'is_name_asked',
+            'is_name_provided',
+            'is_name_used',
+            'is_name_used_3plus'
+        ]
+        if all(col in filtered_df.columns for col in required_cols):
+            def get_chat_ids_bool(df: pl.DataFrame, col: str, target_val: bool) -> set:
+                return set(
+                    df
+                    .filter(
+                        pl.col(col)
+                        .fill_null(False)
+                        .cast(pl.Boolean)
+                        == target_val
+                    )
+                    .select('id')
+                    .unique()
+                    .to_series()
+                    .to_list()
+                )
+            # 1) Сотрудник спрашивал имя?
+            if name_asked == "Да":
+                chat_ids_to_keep &= get_chat_ids_bool(filtered_df, 'is_name_asked', True)
+            elif name_asked == "Нет":
+                chat_ids_to_keep &= get_chat_ids_bool(filtered_df, 'is_name_asked', False)
+            # 2) Имя озвучено клиентом?
+            if name_provided == "Да":
+                chat_ids_to_keep &= get_chat_ids_bool(filtered_df, 'is_name_provided', True)
+            elif name_provided == "Нет":
+                chat_ids_to_keep &= get_chat_ids_bool(filtered_df, 'is_name_provided', False)
+            # 3) Сотрудник обратился по имени?
+            if name_used == "Да":
+                chat_ids_to_keep &= get_chat_ids_bool(filtered_df, 'is_name_used', True)
+            elif name_used == "Нет":
+                chat_ids_to_keep &= get_chat_ids_bool(filtered_df, 'is_name_used', False)
+            # 4) Сотрудник обратился по имени 3+ раз?
+            if name_used_3plus == "Да":
+                chat_ids_to_keep &= get_chat_ids_bool(filtered_df, 'is_name_used_3plus', True)
+            elif name_used_3plus == "Нет":
+                chat_ids_to_keep &= get_chat_ids_bool(filtered_df, 'is_name_used_3plus', False)
+        else:
+            missing = [c for c in required_cols if c not in filtered_df.columns]
+            st.warning(
+                f"Не найдены колонки для фильтра 'Обращение по имени': {missing}. Обновите ETL."
+            )
+
+    
+
+    # Фильтрация по итоговому списку
+    # if chat_ids_to_keep:  # Защита от пустого множества (is_in([]) вернёт пустой DF)
+    filtered_df = filtered_df.filter(pl.col('id').is_in(chat_ids_to_keep))
+
+    # === 🔍 ПОИСК ===
+    search_words = filters_dict.get('search', '')
+    if search_words.strip():
+        
+        # 🔹 Режим 1: нечёткий поиск по ВСЕМ сообщениям (как у вас было)
+        if not filters_dict.get('search_mode_toggle', False):
+            words = [w.strip() for w in search_words.split() if w]
+            combined_mask = pl.Series([False] * len(filtered_df))
+            for word in words:
+                word_mask = fuzzy_trigram_match(
+                    filtered_df['dialog'].fill_null('').cast(pl.String), 
+                    word, 
+                    threshold=0.3
+                )
+                combined_mask |= word_mask
+            chat_ids_with_match = filtered_df.filter(combined_mask)['id'].unique()
+            filtered_df = filtered_df.filter(pl.col('id').is_in(chat_ids_with_match))
+        
+        # 🔹 Режим 2: точный поиск ТОЛЬКО в выбранных типах сообщений
+        else:
+            selected_search_type_codes = filters_dict.get('search_type_codes', [])
+            selected_search_type_codes = [int(c) if isinstance(c, str) else c for c in selected_search_type_codes]
+            if selected_search_type_codes:
+                # 1. Создаём временную колонку: диалог, отфильтрованный по выбранным типам
+                filtered_dialogs = (
+                    filtered_df['dialog']
+                    .fill_null('')
+                    .cast(pl.String)
+                    .map_elements(
+                        lambda d: filter_dialog_by_type_codes(d, selected_search_type_codes),
+                        return_dtype=pl.String
+                    )
+                )
+                
+                # 2. Применяем ваш safe_search_mask к отфильтрованным диалогам
+                mask = safe_search_mask(filtered_dialogs, search_words)
+                
+                # 3. Находим чаты, где есть совпадения
+                matching_chats = filtered_df.filter(mask)['id'].unique()
+                
+                # 4. Фильтруем исходный датафрейм по этим чатам
+                filtered_df = filtered_df.filter(pl.col('id').is_in(matching_chats))
+            else:
+                # Если типы не выбраны — возвращаем пустой результат
+                filtered_df = filtered_df.slice(0, 0)
+
+    # Формируем список чатов (id, dialog)
+    # Для этого собираем данные в Python
+    ids = filtered_df.select(pl.col('id')).to_series().to_list()
+    dialogs = filtered_df.select(pl.col('dialog')).to_series().cast(pl.Utf8).to_list()
+    final_visible_audios = list(zip(ids, dialogs))
+
+    return filtered_df, final_visible_audios
+
+
+# Заголовок с инлайн-стилем
+st.markdown("""
+    <h1 style="text-align: center; font-family: 'Arial Black', sans-serif; 
+               font-size: 30px; color: #8E00F7;">
+        Сервис транскрибации аудио
+    </h1>
+""", unsafe_allow_html=True)
+
+
+
+# Варианты
+options = ["Звонки канала Дистанс", "Онлайн транскрибация аудио"]
+
+# По умолчанию выбран первый (ИНН)
+if 'selected' not in st.session_state:
+    st.session_state.selected = options[0]
+
+# Радиокнопки — как на картинке
+selected = st.radio(
+    label="",
+    options=options,
+    index=0 if st.session_state.selected == options[0] else 1,
+    horizontal=True,
+    key="variant_radio"
+)
+
+# Обновляем состояние (на случай, если пользователь изменил через radio)
+st.session_state.selected = selected
+
+# Отображение логики
+if st.session_state.selected == "Звонки канала Дистанс":
+    PAGE_SIZE = 7
+    
+    # --- Инициализация состояния ---
+    if 'show_message' not in st.session_state:
+        st.session_state.show_message = None
+    if 'pending_extra_actions' not in st.session_state:
+        st.session_state.pending_extra_actions = []
+    if 'applied' not in st.session_state:
+        st.session_state.applied = False
+    if 'show_charts' not in st.session_state:
+        st.session_state.show_charts = True  # по умолчанию — раскрыто
+    if 'filters' not in st.session_state:
+        st.session_state.filters = {}
+    st.session_state.filtered_df = pd.DataFrame()
+    if 'loaded_rows' not in st.session_state:
+        st.session_state.loaded_rows = PAGE_SIZE
+    st.session_state.summary_df = pd.DataFrame()
+    if 'full_filtered_df' not in st.session_state:
+        st.session_state.full_filtered_df = pd.DataFrame()
+    if 'polite_employee_include' not in st.session_state:
+        st.session_state.polite_employee_include = True
+
+
+    try:
+        # --- Стили ---
+        st.markdown("""
+        <style>
+        
+        [data-testid="stSidebar"] { width: 180px; min-width: 180px; max-width: 200px; }
+        .block-container {
+            padding-left: 2rem !important;
+            padding-right: 2rem !important;
+            padding-top: 2rem !important;
+            padding-bottom: 0.5rem !important;
+            max-width: 100% !important;
+        }
+        .table-container {
+            overflow-x: auto;
+            width: 100%;
+            margin-top: 10px;
+            white-space: nowrap;
+        }
+        .table-container::-webkit-scrollbar { height: 30px; }
+        .table-container::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 4px; }
+        .table-container::-webkit-scrollbar-thumb { background: #8E00F7; border-radius: 40px; }
+        .table-container::-webkit-scrollbar-thumb:hover { background: #6A00B3; }
+        .clean-table-header, .clean-table-row {
+            display: grid;
+            grid-template-columns: 80px 80px 700px 100px 100px 100px 120px 120px 100px 100px 100px 100px 100px 100px 100px 100px 100px 100px;
+            gap: 0;
+            min-width: max-content;
+        }
+        .clean-table-header {
+            padding: 4px 2px !important;
+            background-color: #f0e6ff;
+            color: #8E00F7;
+            font-weight: bold;
+            font-size: 14px;
+            text-align: center;
+            border-bottom: 1px solid #ccc;
+            margin-bottom: 6px;
+        }
+        .clean-table-row {
+            padding: 2px 1px !important;
+            align-items: flex-start;
+            min-height: 60px;
+        }
+        .clean-cell {
+            font-size: 14px;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            padding: 0 1px !important;
+            line-height: 1.3;
+            word-break: break-word;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            min-height: 50px;
+        }
+        .scrollable-preview {
+            max-height: 100px;
+            overflow: auto;
+            font-family: monospace;
+            font-size: 13px;
+            background-color: #fcfaff;
+            padding: 2px 3px !important;
+            border-radius: 2px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            margin: 0 !important;
+        }
+        div[data-testid="column"] label[data-testid="stCheckboxLabel"] {
+            background-color: #f5f0ff !important;
+            color: #8E00F7 !important;
+            border: 1px solid #d9c2ff !important;
+            border-radius: 2px !important;
+            padding: 0 6px !important;
+            font-family: Arial, sans-serif !important;
+            font-size: 11px !important;
+            font-weight: normal !important;
+            height: 22px !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            width: 100% !important;
+            box-sizing: border-box !important;
+            cursor: pointer !important;
+            margin: 4px 0 !important;
+        }
+        div[data-testid="column"] label[data-testid="stCheckboxLabel"]:hover {
+            background-color: #e6d9ff !important;
+        }
+        div[data-testid="column"] input[type="checkbox"] { display: none !important; }
+        hr { margin: 1px 0 !important; border: 0; border-top: 1px solid #f0f0f0 !important; }
+        .stDownloadButton > button {
+            background-color: #e0d0ff !important;
+            color: #6A00B3 !important;
+            border: 1px solid #8E00F7 !important;
+            font-size: 14px !important;
+            font-family: 'Arial Black', sans-serif !important;
+            font-weight: bold !important;
+            border-radius: 6px !important;
+            padding: 8px 16px !important;
+            height: auto !important;
+            margin-top: 8px !important;
+        }
+        .stDownloadButton > button:hover { background-color: #d0c0ff !important; }
+        div[data-testid="load_more"] > button {
+            background-color: #6A00B3 !important;
+            color: white !important;
+            border: 1px solid #8E00F7 !important;
+            font-size: 14px !important;
+            font-family: 'Arial Black', sans-serif !important;
+            font-weight: bold !important;
+            border-radius: 6px !important;
+            padding: 8px 16px !important;
+            height: auto !important;
+            margin-top: 8px !important;
+        }
+        div[data-testid="load_more"] > button:hover { background-color: #b08ff0 !important; }
+        .search-label {
+            font-size: 14px;
+            font-weight: bold;
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .search-tooltip {
+            position: relative;
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            cursor: help;
+            transform: translateY(-4px);
+        }
+        .search-tooltip svg {
+            width: 16px;
+            height: 16px;
+            fill: #8E00F7;
+            opacity: 0.8;
+            transition: opacity 0.2s;
+        }
+        .search-tooltip:hover svg { opacity: 1; }
+        .search-tooltip .tooltiptext {
+            visibility: hidden;
+            width: 280px;
+            background-color: #ffffff;
+            color: #333;
+            text-align: left;
+            border-radius: 6px;
+            padding: 10px;
+            position: absolute;
+            z-index: 100;
+            bottom: 125%;
+            left: 50%;
+            margin-left: -140px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            font-size: 12px;
+            border: 1px solid #e0d0ff;
+            box-shadow: 0 3px 8px rgba(142, 0, 247, 0.12);
+            font-family: Arial, sans-serif;
+            line-height: 1.5;
+        }
+        .search-tooltip:hover .tooltiptext { visibility: visible; opacity: 1; }
+        .clear-filters-button button {
+            font-size: 16px !important;
+            font-weight: normal !important;
+            border-radius: 6px !important;
+            padding: 6px 20px !important;
+            height: 40px !important;
+            width: 100% !important;
+            background-color: white !important;
+            color: black !important;
+            border: 1px solid #ccc !important;
+        }
+        .clear-filters-button button:hover { background-color: #f0f0f0 !important; }
+        .filters-container {
+            border: 1px solid #e0d0ff;
+            border-radius: 8px;
+            padding: 16px;
+            background-color: #faf5ff;
+            margin-bottom: 16px;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        
+
+    
+        def get_connection():
+            now = datetime.datetime.now().time()
+            if now < datetime.time(18, 55) and now > datetime.time(5, 5):
+                return SqlAlchemyConnector.load("sbdmas", _sync=True)   #print("Prod")
+            else:
+                return SqlAlchemyConnector.load("stbsbdmas", _sync=True)    #print("StandBy")
+        
+        
+        # Декоратор для кэширования данных
+        @st.cache_data(ttl=60)  # ttl — время жизни кэша в секундах (30 минут) # 7200
+        def load_data(prefix: str = 'ifa/audio_serv'):
+            s3 = S3Bucket.load('s3')
+            filename = "audio_base.parquet"
+            s3_key = f"{prefix}/{filename}"
+            raw = s3.read_path(s3_key)
+            df = pl.read_parquet(BytesIO(raw))
+            return df
+
+        full_df = load_data()
+        full_df = full_df.rename({col: col.lower() for col in full_df.columns})
+        full_df = full_df.with_columns(
+            pl.col('ddate')
+        )
+        # ['id_chat', 'id_client', 'id_manag', 'ddate', 'assigned_category']
+        df_meta = full_df.unique(subset=['id'], keep='first')
+        
+        valid_dates = df_meta.select(pl.col('ddate').drop_nulls()).to_series()
+        if valid_dates.is_empty():
+            st.error("❌ В данных отсутствуют корректные даты.")
+            st.stop()
+        min_d = valid_dates.min().date()
+        max_d = valid_dates.max().date()
+        min_default_date = max(min_d, max_d - timedelta(days=3))
+        default_date_range = (min_default_date, max_d)
+
+        if 'date_from' in st.session_state:
+            df_meta_filtered = df_meta.filter(
+                (pl.col('ddate').dt.date() >= st.session_state['date_from']) & 
+                (pl.col('ddate').dt.date() <= st.session_state['date_to'])
+            )
+        else:
+            df_meta_filtered = df_meta.filter(
+                (pl.col('ddate').dt.date() >= min_default_date) & 
+                (pl.col('ddate').dt.date() <= max_d)
+            )
+
+        
+        # 2. Теперь собираем списки УЖЕ ИЗ отфильтрованного датафрейма (df_meta_filtered)
+        all_audio = sorted(df_meta_filtered.select(pl.col('id').drop_nulls()).to_series().cast(pl.Utf8).unique().to_list())
+        all_phone = sorted(df_meta_filtered.select(pl.col('phone').drop_nulls()).to_series().cast(pl.Utf8).unique().to_list())
+        all_clients = sorted(df_meta_filtered.select(pl.col('inn').drop_nulls()).to_series().cast(pl.Utf8).unique().to_list())
+        all_directions = sorted(df_meta_filtered.select(pl.col('direction').drop_nulls()).to_series().cast(pl.Utf8).unique().to_list())
+        all_managers = sorted(df_meta_filtered.select(pl.col('employeename').drop_nulls()).to_series().cast(pl.Utf8).unique().to_list())
+        all_contact_id = sorted(df_meta_filtered.select(pl.col('contact_id').drop_nulls()).to_series().cast(pl.Utf8).unique().to_list())
+        all_theme_1_1 = sorted(df_meta_filtered.select(pl.col('theme_1_1').drop_nulls()).to_series().cast(pl.Utf8).unique().to_list())
+        all_theme_1_2 = sorted(df_meta_filtered.select(pl.col('theme_1_2').drop_nulls()).to_series().cast(pl.Utf8).unique().to_list())
+        # all_emotion = sorted(df_meta_filtered.select(pl.col('has_emotion').drop_nulls()).to_series().cast(pl.Utf8).unique().to_list())
+
+        # === URL-параметры ===
+        query_params = st.query_params
+        if "apply_inn" in query_params and "inn" in query_params:
+            inn_from_url = query_params["inn"]
+            if inn_from_url and inn_from_url not in ("", "None", "nan"):
+                # Устанавливаем фильтры
+                # ШАГ 2: Теперь безопасно используем type_codes
+                st.session_state.filters = {
+                    'client': [inn_from_url],
+                    'date_ui': (min_d, max_d),
+                    'date_actual': (min_d, max_d),
+                    'use_full_range': True,
+                    # 'type_labels': [TYPE_LABELS[code] for code in TYPE_LABELS.keys() if code != 0],
+                    # 'type_codes': [code for code in TYPE_LABELS.keys() if code != 0],  # ← ДОБАВЛЕНО
+                    'extra': [],
+                    # 'extra_actions': [],
+                    'expand_all': False,
+                    # 'channel': [],
+                    # 'assigned_category': [],
+                    'products': [],
+                    # 'ratings': ["1", "2", "3", "4", "5"],
+                    'search': "",
+                    # 'search_mode_toggle': False,
+                    'audio': [],
+                    'phone': [],
+                    'direction': [],
+                    'manager': [],
+                    'contact_id': [],
+                    # 'emotion': [],
+                }
+                
+                # ШАГ 3: Применяем фильтры
+                filtered_df, final_visible_audios = apply_filters_logic(full_df, st.session_state.filters)
+                
+                if final_visible_audios:
+                    st.session_state.applied = True
+                    st.session_state.final_visible_audios = final_visible_audios
+                    st.session_state.full_filtered_df = filtered_df
+                else:
+                    st.session_state.applied = False
+                    st.warning("Нет данных по выбранным фильтрам.")
+
+        # === Фильтры ===
+        st.markdown("""<h2 style="font-family: 'Arial Black'; color: #8E00F7; font-size: 22px;">Фильтры</h2>""", unsafe_allow_html=True)
+
+        
+        # Читаем состояние чекбокса
+        use_full_range = st.session_state.filters.get('use_full_range', False)
+    
+        # Определяем значение для date_input
+        if use_full_range:
+            widget_date_value = (min_d, max_d)
+        else:
+            widget_date_value = st.session_state.filters.get('date_ui', default_date_range)
+        
+        # Создаём колонки: 4 основных + узкая для чекбокса
+        col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 0.1])
+        col6, col7, col8, col9, col10= st.columns([1, 1, 1, 1, 0.1])
+
+    
+        with col1:
+            st.markdown('<div class="search-label">ID диалога</div>', unsafe_allow_html=True)
+            selected_audio = st.multiselect("", options=all_audio, default=st.session_state.filters.get('audio', []), placeholder="Выберите номер диалога", label_visibility="collapsed", key="filter_audio")
+
+        with col2:
+            st.markdown('<div class="search-label">Телефон клиента</div>', unsafe_allow_html=True)
+            selected_phone = st.multiselect("", options=all_phone, default=st.session_state.filters.get('phone', []), placeholder="Выберите Телефон клиента", label_visibility="collapsed", key="filter_phone")
+            
+        with col3:
+            st.markdown('<div class="search-label">ИНН клиента</div>', unsafe_allow_html=True)
+            selected_client = st.multiselect("", options=all_clients, default=st.session_state.filters.get('client', []), placeholder="Выберите ИНН клиента", label_visibility="collapsed", key="filter_client")
+
+        with col4:
+            st.markdown('<div class="search-label">Дата</div>', unsafe_allow_html=True)
+            # Динамический ключ: меняется при смене чекбокса → создаётся новый виджет
+            date_key = f"filter_date_{use_full_range}"
+            # widget_date_value = st.session_state.filters.get('date_ui', default_date_range)
+            sel_date = st.date_input(
+                "",
+                value=widget_date_value,
+                min_value=min_d,
+                max_value=max_d,
+                label_visibility="collapsed",
+                key=date_key
+            )
+            new_filter_start = st.session_state.get('date_from', min_default_date)
+            new_filter_end = st.session_state.get('date_to', max_d)
+
+            if isinstance(sel_date, tuple):
+                filter_start, filter_end = sel_date
+            else:
+                # Если выбрана одна дата, считаем диапазон как один день
+                filter_start = sel_date
+                filter_end = sel_date
+
+            if (new_filter_start != filter_start) or (new_filter_end != filter_end):
+                st.session_state['date_from'] = filter_start
+                st.session_state['date_to'] = filter_end
+                st.rerun()
+
+        with col5:
+            st.markdown('''
+            <div class="search-label" style="width: fit-content;">
+                <div class="search-tooltip">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                        <path d="M11,18H13V16H11V18M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,6A4,4 0 0,0 8,10H10A2,2 0 0,1 12,8A2,2 0 0,1 14,10C14,12 11,11.75 11,15H13C13,12.75 16,12.5 16,10A4,4 0 0,0 12,6Z" />
+                    </svg>
+                    <span class="tooltiptext">Включите, чтобы выбрать<br> весь доступный период</span>
+                </div>
+            </div>
+            ''', unsafe_allow_html=True)
+            
+            # Чекбокс с обработчиком изменения
+            new_use_full_range = st.checkbox(
+                label="",
+                value=use_full_range,
+                key="use_full_range",
+                label_visibility="collapsed"
+            )
+            
+            # Если значение изменилось — сохраняем и перезапускаем
+            if new_use_full_range != use_full_range:
+                st.session_state.filters['use_full_range'] = new_use_full_range
+                st.rerun()
+            
+        with col6:
+            st.markdown('<div class="search-label">ФИО сотрудника</div>', unsafe_allow_html=True)
+            selected_manager = st.multiselect("", options=all_managers, default=st.session_state.filters.get('manager', []), placeholder="Выберите ФИО сотрудника", label_visibility="collapsed", key="filter_manager")
+    
+        with col7:
+            st.markdown('<div class="search-label">ID контакта Verint</div>', unsafe_allow_html=True)
+            selected_contact_id = st.multiselect("", options=all_contact_id, default=st.session_state.filters.get('contact_id', []), placeholder="Выберите ID контакта", label_visibility="collapsed", key="filter_contact_id")
+
+        with col8:
+            st.markdown('<div class="search-label">Дирекция</div>', unsafe_allow_html=True)
+            selected_direction = st.multiselect("", options=all_directions, default=st.session_state.filters.get('direction', []), placeholder="Выберите дирекцию сотрудника", label_visibility="collapsed", key="filter_direction")
+
+        # with col9:
+        #     st.markdown('<div class="search-label">Негатив</div>', unsafe_allow_html=True)
+        #     selected_emotion = st.multiselect("", options=all_emotion, default=st.session_state.filters.get('', []), placeholder="1 - есть, 2 - нет", label_visibility="collapsed", key="filter_emotion")
+
+        # with col10:
+        #     pass
+            
+
+
+        
+
+        # Сохраняем состояние после рендера
+        st.session_state.filters['date_ui'] = sel_date
+        if use_full_range:
+            actual_date_range = (min_d, max_d)
+        else:
+            actual_date_range = sel_date
+        st.session_state.filters['date_actual'] = actual_date_range
+
+        # Дополнительные фильтры
+        st.markdown(f'<div class="search-label">Дополнительные фильтры<div class="search-tooltip"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M11,18H13V16H11V18M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,6A4,4 0 0,0 8,10H10A2,2 0 0,1 12,8A2,2 0 0,1 14,10C14,12 11,11.75 11,15H13C13,12.75 16,12.5 16,10A4,4 0 0,0 12,6Z" /></svg><span class="tooltiptext">{extra_help}</span></div></div>', unsafe_allow_html=True)
+        extra_options = [
+            "Вежливость со стороны сотрудника",
+            "Диалог с эмоциональной окраской со стороны клиента",
+            "Тематика обращений 1.1",
+            "Тематика обращений 1.2",
+            "Обращение по имени",
+        ]
+        
+        selected_extra = st.multiselect("", options=extra_options, default=st.session_state.filters.get('extra', []), placeholder="Выберите фильтр", label_visibility="collapsed", key="filter_extra")
+
+        # подфильтры
+        selected_theme_1_1=st.session_state.filters.get('theme_1_1', [])
+        selected_theme_1_2=st.session_state.filters.get('theme_1_2', [])
+
+        if "Вежливость со стороны сотрудника" in selected_extra:
+            st.markdown("---")
+            st.markdown(
+                '<div style="font-size: 13px; font-weight: 600; color: #555; margin: 8px 0 4px 0;">'
+                'Вежливость со стороны сотрудника:</div>',
+                unsafe_allow_html=True
+            )
+            
+            polite_choice = st.radio(
+                "Включить вежливые диалоги?",
+                options=["Да", "Нет"],
+                index=0 if st.session_state.polite_employee_include else 1,  # По умолчанию "Да"
+                key="radio_polite_employee",
+                horizontal=True,
+                label_visibility="collapsed"
+            )
+            
+            # Сохраняем выбор: True = включать, False = исключать
+            st.session_state.polite_employee_include = (polite_choice == "Да")
+
+        if "Тематика обращений 1.1" in selected_extra:
+            selected_theme_1_1 = st.multiselect("Тематика обращений 1.1", options=all_theme_1_1, default=selected_theme_1_1, key="filter_theme_1_1", placeholder="Выберите тему")
+
+        if "Тематика обращений 1.2" in selected_extra:
+            selected_theme_1_2 = st.multiselect("Тематика обращений 1.2", options=all_theme_1_2, default=selected_theme_1_2, key="filter_theme_1_2", placeholder="Выберите тему")
+
+        # --- Подфильтр: Обращение по имени (4 колонки) ---
+        if "Обращение по имени" in selected_extra:
+            st.markdown("---")
+            
+            # Создаем 4 колонки для компактного размещения
+            col_ask, col_prov, col_used, col_3plus = st.columns(4)
+            
+            with col_ask:
+                st.caption("Сотрудник спрашивал")
+                name_asked = st.radio(
+                    "filter_asked",
+                    options=["Любой", "Да", "Нет"],
+                    index=0,
+                    key="radio_name_asked",
+                    label_visibility="collapsed",
+                    horizontal=True
+                )
+                
+            with col_prov:
+                st.caption("Клиент представился")
+                name_provided = st.radio(
+                    "filter_provided",
+                    options=["Любой", "Да", "Нет"],
+                    index=0,
+                    key="radio_name_provided",
+                    label_visibility="collapsed",
+                    horizontal=True
+                )
+                
+            with col_used:
+                st.caption("Сотрудник обратился")
+                name_used = st.radio(
+                    "filter_used",
+                    options=["Любой", "Да", "Нет"],
+                    index=0,
+                    key="radio_name_used",
+                    label_visibility="collapsed",
+                    horizontal=True
+                )
+                
+            with col_3plus:  # 🔹 НОВАЯ ЧЕТВЁРТАЯ КОЛОНКА
+                st.caption("Обратился ≥3 раз")
+                name_used_3plus = st.radio(
+                    "filter_3plus",
+                    options=["Любой", "Да", "Нет"],
+                    index=0,
+                    key="radio_name_3plus",
+                    label_visibility="collapsed",
+                    horizontal=True
+                )
+            
+            # Сохраняем все 4 значения в session_state
+            st.session_state.filters['name_asked'] = name_asked
+            st.session_state.filters['name_provided'] = name_provided
+            st.session_state.filters['name_used'] = name_used
+            st.session_state.filters['name_used_3plus'] = name_used_3plus  # 🔹 Новое
+
+        
+        # selected_products = st.session_state.filters.get('products', [])
+
+        
+        # if "Вопрос по продукту" in selected_extra:
+        #     selected_products = st.multiselect(
+        #         label="Выберите продукты",
+        #         options=list(PRODUCT_KEYWORDS.keys()),
+        #         default=st.session_state.filters.get('products', []),
+        #         key="filter_products",
+        #         placeholder="Выберите продукты"
+        #     )
+        # Поиск по словам
+        st.markdown(f'<div class="search-label">Поиск по словам<div class="search-tooltip"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M11,18H13V16H11V18M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,6A4,4 0 0,0 8,10H10A2,2 0 0,1 12,8A2,2 0 0,1 14,10C14,12 11,11.75 11,15H13C13,12.75 16,12.5 16,10A4,4 0 0,0 12,6Z" /></svg><span class="tooltiptext">{search_help}</span></div></div>', unsafe_allow_html=True)
+        search_row = st.columns([0.1, 0.6, 1.5], gap="small")
+        with search_row[0]:
+            toggle_value = st.toggle("", value=st.session_state.filters.get('search_mode_toggle', False), key="search_mode_toggle")
+        with search_row[1]:
+            st.markdown('<div style="display: flex; align-items: center; height: 100%; padding-left: 8px;"><span style="font-size: 14px; color: #555; line-height: 3;">Искать только в выбранных типах сообщений</span></div>', unsafe_allow_html=True)
+        with search_row[2]:
+            search_words = st.text_input("", value=st.session_state.filters.get('search', ""), placeholder="Введите слова или фразу...", label_visibility="collapsed", key="filter_search")
+    
+        all_type_codes_in_data = sorted(TYPE_LABELS.keys())
+        default_type_labels = [TYPE_LABELS[code] for code in all_type_codes_in_data if code != 0]
+        # Фильтры типов при активном тумблере
+        # === Чекбоксы типов (показываются только при toggle_value=True) ===
+        selected_search_type_codes = []
+        if toggle_value:
+            # Доступные для поиска типы: 0=Клиент, 1=Сотрудник
+            all_searchable_type_codes = [0, 1]
+            
+            # Синхронизация с основным фильтром типов
+            main_filter_type_labels = st.session_state.filters.get('type_labels', [])
+            default_search_type_labels = [
+                label for label in [TYPE_LABELS[c] for c in all_searchable_type_codes] 
+                if label in main_filter_type_labels or not main_filter_type_labels
+            ]
+            default_search_type_codes = [
+                c for c in all_searchable_type_codes 
+                if TYPE_LABELS[c] in default_search_type_labels
+            ]
+            
+            # 🔧 Инициализируем search_type_codes ОДИН РАЗ при первом рендере
+            if 'search_type_codes' not in st.session_state:
+                st.session_state['search_type_codes'] = default_search_type_codes
+            
+            # Рендер чекбоксов
+            search_type_filters_row = st.columns([0.7, 0.7, 3], gap="small")
+            for idx, code in enumerate(all_searchable_type_codes):
+                label = TYPE_LABELS[code]
+                checkbox_key = f"search_type_{code}"
+                is_checked = code in st.session_state.get('search_type_codes', [])
+                with search_type_filters_row[idx]:
+                    short_label = label.split(' - ', 1)[1] if ' - ' in label else str(code)
+                    if st.checkbox(short_label, value=is_checked, key=checkbox_key):
+                        selected_search_type_codes.append(code)
+
+            
+            # Сохраняем выбранные коды в session_state
+            st.session_state['search_type_codes'] = selected_search_type_codes
+        else:
+            # При выключенном тумблере очищаем, чтобы не передавать лишнее в логику
+            st.session_state.pop('search_type_codes', None)
+
+        # --- Блок SQL-поиска ---
+        sql_mode = st.toggle(
+            "🔍 Использовать SQL-условие для поиска по диалогу", 
+            value=False, 
+            key="sql_mode_toggle"
+        )
+        if sql_mode:
+            st.markdown(
+                '<div style="font-size:12px; color:#555; margin-bottom:4px;">'
+                'Язык PostgreSQL. Столбцы в нижнем регистре: <code>dialog</code>, <code>ddate</code>, <code>id</code> и т.д. '
+                'Поддерживается regexp_matches, даты, AND/OR.</div>',
+                unsafe_allow_html=True
+            )
+            sql_condition = st.text_area(
+                "",
+                value=st.session_state.filters.get('sql_condition', ""),
+                placeholder="Например: regexp_matches(lower(dialog), 'бизнес[ -]?карт|бизнескар', 'i')",
+                label_visibility="collapsed",
+                key="filter_sql_condition",
+                height=90
+            )
+        else:
+            sql_condition = ""
+
+            
+        expand_all = st.checkbox("Показывать чаты раскрытыми", value=st.session_state.filters.get('expand_all', False), key="filter_expand_all")
+
+        # Определяем фактический диапазон дат для фильтрации
+        if use_full_range:
+            actual_date_range = (min_d, max_d)
+        else:
+            actual_date_range = sel_date
+        
+        # Применение фильтров
+        btn_apply_clear = st.columns([1, 1])
+        with btn_apply_clear[0]:            
+            @action
+            def apply_filters():
+                # 1. Формируем базовый словарь фильтров на основе текущего выбора в UI
+                # (Фактический диапазон дат уже определен выше: либо sel_date, либо (min_d, max_d))
+                current_filters = {
+                    'audio': selected_audio,
+                    'phone': selected_phone,
+                    'client': selected_client,
+                    'direction': selected_direction,
+                    'manager': selected_manager,
+                    'contact_id': selected_contact_id,
+                    'date_ui': sel_date,
+                    'date_actual': actual_date_range, 
+                    'use_full_range': use_full_range,
+                    'extra': selected_extra,
+                    'search': search_words,
+                    'expand_all': expand_all,
+                    'search_mode_toggle': toggle_value,
+                    # 'emotion': selected_emotion,
+                    'search_type_codes': selected_search_type_codes if toggle_value else [],
+                    'theme_1_1': selected_theme_1_1,
+                    'theme_1_2': selected_theme_1_2,
+                    'polite_employee_include': st.session_state.polite_employee_include,
+                    'name_asked': st.session_state.filters.get('name_asked', 'Любой'),
+                    'name_provided': st.session_state.filters.get('name_provided', 'Любой'),
+                    'name_used': st.session_state.filters.get('name_used', 'Любой'),
+                    'name_used_3plus': st.session_state.filters.get('name_used_3plus', 'Любой'),  
+
+                    # Добавьте остальные активные поля, которые у вас используются
+                }
+                
+                # 2. ПЕРВАЯ ПОПЫТКА: Поиск по выбранным фильтрам (включая выбранные даты)
+                filtered_df, final_visible_audios = apply_filters_logic(full_df, current_filters)
+
+                # 3. Применяем SQL-условие поверх уже отфильтрованных данных (оптимизация скорости)
+                if sql_mode and sql_condition.strip():
+                    current_filters['sql_condition'] = sql_condition
+                    filtered_df = apply_sql_dialog_filter(filtered_df, sql_condition)
+                    
+                    # Обновляем список видимых диалогов после SQL-фильтрации
+                    if not filtered_df.is_empty():
+                        final_visible_audios = list(zip(
+                            filtered_df['id'].to_list(), 
+                            filtered_df['dialog'].fill_null('').cast(pl.Utf8).to_list()
+                        ))
+                    else:
+                        final_visible_audios = []
+                
+                if final_visible_audios:
+                    # --- УСПЕХ: Данные найдены в выбранном диапазоне ---
+                    st.session_state.applied = True
+                    st.session_state.final_visible_audios = final_visible_audios
+                    st.session_state.full_filtered_df = filtered_df
+                    st.session_state.filters = current_filters
+                    # st.success(f"Найдено записей: {len(final_visible_audios)}")
+                    
+                else:
+                    # --- НЕУДАЧА: По выбранным датам пусто ---
+                    
+                    # 3. ВТОРАЯ ПОПЫТКА: Проверяем, есть ли данные вообще (по всем датам)
+                    # Делаем это только если пользователь НЕ выбрал галочку "Весь период"
+                    if not use_full_range:
+                        # Создаем временную копию фильтров для проверки по полному диапазону
+                        full_range_filters = current_filters.copy()
+                        full_range_filters['date_actual'] = (min_d, max_d)
+                        full_range_filters['date_ui'] = (min_d, max_d) # Для консистентности
+                        full_range_filters['use_full_range'] = True
+                        
+                        # Запускаем логику с полным диапазоном дат
+                        _, fallback_audios = apply_filters_logic(full_df, full_range_filters)
+                        
+                        if fallback_audios:
+                            # Данные есть, но они не попадают в выбранные даты
+                            st.warning(
+                                f"⚠️ **По выбранным датам данных нет.**\n\n"
+                                f"Найдено **{len(fallback_audios)} записей** в других периодах "
+                                f"(всего в базе с {min_d} по {max_d}).\n"
+                                f"Расширьте диапазон дат или включить опцию 'Весь период'."
+                            )
+                            # Не меняем st.session_state.applied на True, так как таблица должна оставаться пустой
+                            # согласно текущему выбору дат, но информируем пользователя.
+                            st.session_state.applied = False 
+                        else:
+                            # Данных нет вообще нигде при таких фильтрах
+                            st.error("❌ **Нет данных по выбранным фильтрам.**")
+                            st.session_state.applied = False
+                    else:
+                        # Пользователь уже выбрал "Весь период", и данных все равно нет
+                        st.error("❌ **Нет данных по выбранным фильтрам.**")
+                        st.session_state.applied = False
+            
+            if st.button("Применить фильтры", key="apply_filters", use_container_width=True):
+                apply_filters()
+    
+        with btn_apply_clear[1]:
+            service_url = "https://corporate-service.run.fc.uralsibbank.ru/test_ep_comm_v2"
+            st.markdown(f"""
+            <div class="clear-filters-button">
+                <a href="{service_url}" target="_self">
+                    <button>Очистить фильтры</button>
+                </a>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Отображение результатов — ТОЛЬКО ПОСЛЕ ПРИМЕНЕНИЯ
+        if st.session_state.applied:
+            final_visible_audios = st.session_state.final_visible_audios
+            full_filtered_df = st.session_state.full_filtered_df
+            total_visible = len(final_visible_audios)
+            st.markdown(
+                f"<h5 style='text-align: left; color: #8E00F7; font-family: Arial;'>Найдено {total_visible} диалогов</h5>",
+                unsafe_allow_html=True
+            )
+
+             # Тумблер для сворачивания графиков
+            show_charts = st.toggle("Свернуть графики", value=not st.session_state.show_charts, key="toggle_charts")
+            st.session_state.show_charts = not show_charts  # инвертируем: тумблер = "свернуть", значит True → скрыть
+    
+            # Графики — безопасно, так как 'date' точно есть
+            start_date, end_date = st.session_state.filters['date_actual']
+            if not isinstance(start_date, date):
+                start_date = start_date.date()
+            if not isinstance(end_date, date):
+                end_date = end_date.date()
+            if st.session_state.show_charts:
+                visible_chat_ids = [cid for cid, _ in final_visible_audios]
+                st.plotly_chart(build_chart(full_df, visible_chat_ids, (start_date, end_date)), use_container_width=True)
+                # visible_df_for_extra = full_df[full_df['id'].isin(visible_chat_ids)]
+                # st.plotly_chart(build_extra_chart(visible_df_for_extra, (start_date, end_date)), use_container_width=True)
+        
+            # Summary
+            summary = []
+            for audio_id, dialog_text in final_visible_audios:
+                # Находим соответствующую строку в отфильтрованном датафрейме
+                row = full_filtered_df.filter(pl.col('id') == audio_id).limit(1).to_dicts()[0]  # Изменили 'id_audio' на 'id'
+                inn = row['inn']  # Изменили 'id_client' на 'employeename'
+                summary.append({
+                    'Дата': row['ddate'].strftime('%Y-%m-%d'),
+                    'Номер диалога': str(audio_id),  # Убедитесь, что это строка
+                    'ФИО сотрудника': str(row['employeename']),  # Изменили 'id_manag' на 'employeename'
+                    'Сообщения в диалоге': dialog_text,
+                    'Длительность разговора': str(row['min_duration']),
+                    'ИНН': row['inn'] if inn is not None else '',
+                    'Сервис советник': f"https://bk/Info/Articles/Page.asp?ID=78937&inn={inn}",  # Возможно, нужно изменить параметр
+                    'in_lfb': row['in_lfb'],
+                    'Телефон': row['phone'],
+                    'Время': row['time_start'],
+                    'ID контакта': row['contact_id'],
+                    'Дирекция': row['direction'],
+                    'Тема обращения 1.1': row['theme_1_1'] if row['theme_1_1'] is not None else '',
+                    'Тема обращения 1.2': row['theme_1_2'] if row['theme_1_1'] is not None else '',
+                    'Вежливость сотрудника': 'Да' if row['employee_politeness'] else 'Нет',
+                })
+        
+            summary_df = pl.DataFrame(summary)
+            export_df = summary_df.clone()
+            st.session_state.summary_df = summary_df
+        
+            # Вывод таблицы
+            PAGE_SIZE = 7
+            total_rows = len(summary_df)
+            current_rows = min(st.session_state.loaded_rows, total_rows)
+            display_df = summary_df.head(current_rows)
+        
+            st.markdown('<div class="table-container">', unsafe_allow_html=True)
+            st.markdown("""
+            <div class="clean-table-header">
+                <div>Дата</div>
+                <div>Время</div>
+                <div>Сообщения в диалоге</div>
+                <div>Длительность разговора</div>
+                <div>ИНН</div>
+                <div>Телефон</div>
+                <div>Номер диалога</div>
+                <div>ФИО сотрудника</div>
+                <div>ID контакта Verint</div>
+                <div>Сервис советник</div>
+                <div>Дирекция</div>     
+                <div>Тематика обращения 1.1</div>     
+                <div>Тематика обращения 1.2</div>     
+                <div>Вежливость сотрудника</div>     
+            </div>
+            """, unsafe_allow_html=True)
+        
+            for row in display_df.iter_rows(named=True):
+                audio_id = row['Номер диалога']
+                checkbox_key = f"cb_show_full_{audio_id}"
+                employeename_val = row['ФИО сотрудника']
+
+                if row['ИНН'] != '' and str(row['in_lfb']) != '0':
+                    st.markdown(f"""
+                    <div class="clean-table-row">
+                        <div class="clean-cell" style="justify-content: center;">{row['Дата']}</div>
+                        <div class="clean-cell" style="justify-content: center;">{row['Время']}</div>
+                        <div class="clean-cell"><div class="scrollable-preview">{row["Сообщения в диалоге"]}</div></div>
+                        <div class="clean-cell" style="justify-content: center;">{row['Длительность разговора']}</div>
+                        <div class="clean-cell" style="justify-content: center;">{row['ИНН']}</div>
+                        <div class="clean-cell" style="justify-content: center;">{row['Телефон']}</div>
+                        <div class="clean-cell" style="justify-content: center;">{row['Номер диалога']}</div>
+                        <div class="clean-cell" style="justify-content: center;">{row['ФИО сотрудника']}</div> 
+                        <div class="clean-cell" style="justify-content: center;">{row['ID контакта']}</div> 
+                        <div class="clean-cell" style="justify-content: center;">
+                            <a href="{row['Сервис советник']}" target="_blank" style="text-decoration: none; color: #8E00F7; font-size: 18px;">📄</a>
+                        </div>
+                        <div class="clean-cell" style="justify-content: center;">{row['Дирекция']}</div> 
+                        <div class="clean-cell" style="justify-content: center;">{row['Тема обращения 1.1']}</div> 
+                        <div class="clean-cell" style="justify-content: center;">{row['Тема обращения 1.2']}</div> 
+                        <div class="clean-cell" style="justify-content: center;">{row['Вежливость сотрудника']}</div> 
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                    <div class="clean-table-row">
+                        <div class="clean-cell" style="justify-content: center;">{row['Дата']}</div>
+                        <div class="clean-cell" style="justify-content: center;">{row['Время']}</div>
+                        <div class="clean-cell"><div class="scrollable-preview">{row["Сообщения в диалоге"]}</div></div>
+                        <div class="clean-cell" style="justify-content: center;">{row['Длительность разговора']}</div>
+                        <div class="clean-cell" style="justify-content: center;">{row['ИНН']}</div>
+                        <div class="clean-cell" style="justify-content: center;">{row['Телефон']}</div>
+                        <div class="clean-cell" style="justify-content: center;">{row['Номер диалога']}</div>
+                        <div class="clean-cell" style="justify-content: center;">{row['ФИО сотрудника']}</div>
+                        <div class="clean-cell" style="justify-content: center;">{row['ID контакта']}</div>
+                        <div class="clean-cell" style="justify-content: center;">{''}</div>
+                        <div class="clean-cell" style="justify-content: center;">{row['Дирекция']}</div> 
+                        <div class="clean-cell" style="justify-content: center;">{row['Тема обращения 1.1']}</div> 
+                        <div class="clean-cell" style="justify-content: center;">{row['Тема обращения 1.2']}</div> 
+                        <div class="clean-cell" style="justify-content: center;">{row['Вежливость сотрудника']}</div> 
+                    </div>
+                    """, unsafe_allow_html=True)
+        
+                show_full = st.checkbox("Показать полностью", key=checkbox_key)
+                should_show_full = st.session_state.filters.get('expand_all', False) or show_full
+                if should_show_full:
+                    full_output = row["Сообщения в диалоге"]
+                    formatted_output = full_output.replace('- ', '- ')
+                    st.markdown(
+                        f'<div style="margin: 6px 0 2px 0; padding: 6px; background-color: #f9f4ff; '
+                        f'border-left: 2px solid #8E00F7; border-radius: 0 4px 4px 0; font-family: monospace; '
+                        f'white-space: pre-wrap; font-size: 11px;">'
+                        f'<b>Полный диалог</b><br>{formatted_output}</div>',
+                        unsafe_allow_html=True
+                    )
+                st.markdown("<hr>", unsafe_allow_html=True)
+        
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            # --- КНОПКА ЗАГРУЗКИ ---
+            with st.container():
+                if current_rows < total_rows:
+                    if st.button("Загрузить ещё", use_container_width=True, key="load_more_btn"):
+                        st.session_state.loaded_rows += PAGE_SIZE
+                        st.rerun()
+                elif total_rows > 0:
+                    st.success(f"Показаны все {total_rows} чатов.")
+    
+            # Экспорт
+            if len(export_df) > 1_000_000:
+                st.error("❌ Объем данных превышает допустимый для формата Excel (макс. 1 млн строк).")
+            elif not export_df.is_empty():
+                def to_excel_with_hyperlinks(df):
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        df.to_pandas().to_excel(writer, index=False, sheet_name='Результаты')  # Преобразуем в pandas для записи в Excel
+                        worksheet = writer.sheets['Результаты']
+                        column_widths = {
+                            "Дата": 12, "Сообщения в диалоге": 80, "Техническое сообщение": 40,
+                            "Номер диалога": 12, "ИНН клиента": 15, "ФИО сотрудника": 20,
+                            "Название организации": 25, "Сервис советник": 25,
+                            "Срок жизни (мес)": 12, "Сегмент": 12, "Страт. клиент": 12,
+                            "Активен 1М": 12, "Активен Finalta": 15, "Новый клиент": 12,
+                            "ML отток": 12, "ML потенц.": 12
+                        }
+                        for i, col in enumerate(df.columns, start=1):
+                            width = column_widths.get(col, 15)
+                            worksheet.column_dimensions[get_column_letter(i)].width = width
+                        if "Сервис советник" in df.columns:
+                            col_idx = list(df.columns).index("Сервис советник") + 1
+                            for row_num, url in enumerate(df["Сервис советник"].to_list(), start=2):  # Преобразуем в список
+                                if url is not None and isinstance(url, str) and url.startswith("http"):
+                                    cell = worksheet.cell(row=row_num, column=col_idx)
+                                    cell.hyperlink = url
+                                    cell.value = "Открыть"
+                                    cell.style = "Hyperlink"
+                        for row_num in range(1, len(df) + 2):
+                            worksheet.row_dimensions[row_num].height = 20
+                    return output.getvalue()
+    
+                excel_data = to_excel_with_hyperlinks(export_df)
+                st.download_button(
+                    label="СКАЧАТЬ В EXCEL",
+                    data=excel_data,
+                    file_name="transcripts_summary.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="download_excel"
+                )
+        
+    except Exception as e:
+        st.markdown("""
+        <div style="
+            padding: 20px;
+            border: 1px solid #ff6347;
+            border-radius: 8px;
+            background-color: #fff5f5;
+            color: #d32f2f;
+            font-family: 'Arial', sans-serif;
+            font-size: 16px;
+            line-height: 1.6;
+            margin: 10px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <strong>❌ Упс, произошла непредвиденная ошибка.</strong><br>
+            Пожалуйста, напишите на почту
+            <a href="mailto:dmas@uralsib.ru" style="color: #8E00F7; text-decoration: underline;">
+                dmas@uralsib.ru
+            </a> со скриншотом ошибки ниже.
+        </div>
+        """, unsafe_allow_html=True)
+        st.exception(e)
+    
+    st.markdown('<div style="margin-bottom: 80px;"></div>', unsafe_allow_html=True)
+else:
+    # st.header("🎙️ Транскрибация новых аудио")
+    # st.info("Здесь будет отображаться интерфейс транскрибации. Также растянут на всю ширину.")
+    # # Пример: st.file_uploader(), st.audio() и т.д.
+    
+    # # Подключение к БД SB_DMAS
+    # def get_connection():
+    #     now = datetime.datetime.now().time()
+    #     if now < datetime.time(19, 55) and now > datetime.time(8, 5):
+    #         return SqlAlchemyConnector.load("sbdmas", _sync=True)   #print("Prod")
+    #     else:
+    #         return SqlAlchemyConnector.load("stbsbdmas", _sync=True)    #print("StandBy")
+    
+    # Список сообщений для отображения во время загрузки
+    # loading_messages = [
+    #     "АБ тестируем… 🚀",
+    #     "Готовим аналитику… 🔍",
+    #     "Считаем метрики… ⏳"
+    # ]
+    
+    # spinner_messages = [
+    #     "💼 Готовим результаты...",
+    #     "📊 Анализируем данные...",
+    #     "📈 Формируем отчёт..."
+    # ]
+    
+    # # Выбираем случайную фразу для show_spinner
+    # random_message = random.choice(loading_messages)
+    
+    # Подключение к БД SB_DMAS
+    def get_connection():
+        now = datetime.datetime.now().time()
+        if now < datetime.time(18, 55) and now > datetime.time(5, 5):
+            return SqlAlchemyConnector.load("sbdmas", _sync=True)   #print("Prod")
+        else:
+            return SqlAlchemyConnector.load("stbsbdmas", _sync=True)    #print("StandBy")
+    
+    
+    # Декоратор для кэширования данных
+    @st.cache_data(ttl=7200)  # ttl — время жизни кэша в секундах (30 минут) # 7200
+    def load_data():
+        connector = get_connection()        # Создаем соединение
+        try:
+            with connector as conn:            # Получаем соединение
+                engine = conn.get_engine()
+                # Выгрузка данных по всем действующим ИНН
+                query = f'''
+                WITH with_shtat as
+                    (select * from 
+                    (select CID,fio, email, row_number() over (partition by CID order by CDW$LOAD_DTTM desc) rn
+                    from sb_dsaap.hfct_employee_structure
+                    where 1=1 
+                    and sysdate between EFFECTIVE_DT and EXPIRATION_DT
+                    and CDW$DELETED_FLG=0
+                    and DATE_OUT is null
+                    )
+                    where 1=1 and length(email) > 5
+                    and rn = 1)
+        
+                select * from with_shtat'''
+                df = pd.read_sql(query, engine)
+                df.columns = map(str.lower, df.columns)
+            return df
+                
+        except Exception as e:
+            # Обработка ошибок
+            st.error(f"Ошибка при загрузке данных: {e}")
+            return None, None
+    
+    
+    def load_file(uploaded_file, original_filename, temp_dir='audio_files'):
+        if uploaded_file is None:
+            return None, None
+    
+        temp_dir_full = temp_dir + '/' + original_filename[:-4]
+        
+        # Создаём папку, если её нет
+        os.makedirs(temp_dir_full, exist_ok=True)
+    
+        # Полный путь к файлу: temp_dir_full/original_filename
+        file_path = os.path.join(temp_dir_full, original_filename)
+    
+    
+        # Записываем содержимое
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getvalue())
+    
+        return str(temp_dir_full), str(original_filename)
+    
+    def cleanup_uploaded_file(temp_dir_full, original_filename):
+        """Удаляет только загруженный файл, не трогая папку."""
+        file_path = Path(temp_dir_full) / original_filename
+        if file_path.exists():
+            os.remove(file_path)
+            print(f"Удалён файл: {file_path}")
+    
+    def file_decoding(folder_path):
+        # декодировка аудиозаписи звонка
+        # folder_path - путь папке с фалом wav и xml от дного звонка
+        # Проходимся по всем файлам в папке
+        for filename in os.listdir(folder_path):
+            if filename.endswith(".wav"):
+                input_file = os.path.join(folder_path, filename)
+    
+                try:
+                    # Читаем файл в переменную
+                    clip = AudioFileClip(input_file)
+                    
+                    # Проверяем длительность
+                    # duration = clip.duration
+                    # max_duration = 900  # 15 минут в секундах
+                    
+                    # if duration > max_duration:
+                    #     # Обрезаем до 15 минут
+                    #     # тк мы не транскрибируем более 2000 символов
+                    #     clip = clip.subclip(0, max_duration)
+                    #     print(f"Файл {filename} был обрезан до 15 минут ({max_duration} сек).")
+                    
+                    # Удаляем исходный файл
+                    os.remove(input_file)
+                    
+                    # Записываем файл обратно с тем же именем
+                    
+                    clip.write_audiofile(input_file, logger=None)
+                    
+                    # Закрываем clip для освобождения ресурсов
+                    clip.close()
+                    return True
+                    
+                except Exception as e:
+                    print(f"Ошибка при загрузке {input_file}: {e}")
+                    os.remove(input_file)
+                    clip = None  # или пропусти файл
+                    return False
+    
+    def to_s3(file_path: str):
+        """
+        Args:
+            file_path (str): Абсолютный или относительный путь к .wav или .xml файлу
+        """
+    
+        # 2. Извлекаем имя файла с расширением
+        file_name = os.path.basename(file_path)  # например, "call_123.wav"
+        name_only = file_name.rsplit(".", 1)[0]  # "call_123"
+    
+        # 3. Формируем object_key в S3
+        object_key = f"srvdmas_transcrip/{name_only}_{uuid.uuid4().hex[:16]}/{file_name}"
+    
+        # 4. Загружаем S3-блок
+        s3 = S3Bucket.load("s3")
+    
+        # 6. Загружаем в S3
+        s3.upload_from_path(file_path, object_key)
+        return object_key
+        
+        
+    # # Загрузка punkt (для разбивки на предложения — на случай fallback)
+    # nltk.download('punkt', quiet=True)
+    
+    # === ПАРАМЕТРЫ ===
+    # AUDIO_FILE = "calls/240004062473444/240004062473444.wav"          # входной стерео-файл
+    MODEL_SIZE = "large-v3"           # или "large-v2", "medium", etc.
+    DEVICE = "cpu"                    # или "cuda" если есть GPU
+    COMPUTE_TYPE = "int8"             # или "float16" для GPU
+    
+    PAUSE_THRESHOLD = 1.0             # секунды: пауза между словами для разбивки
+    MIN_SEGMENT_DURATION = 2.0        # не трогать короткие сегменты
+    MAX_WORDS_PER_SEGMENT = 30        # дополнительная защита от "слипания"
+    
+    
+    def list_and_delete_root_files():
+        s3 = S3Bucket.load("s3")
+        
+        # Получаем все объекты в бакете
+        objects = s3.list_objects()
+        
+        # Фильтруем файлы, которые:
+        # - находятся в корне (нет '/' в имени)
+        # - длина имени == 32
+        root_files_to_delete = [
+            obj['Key'] for obj in objects
+            if '/' not in obj['Key'] and len(obj['Key']) == 32
+        ]
+        
+        print("Файлы в корне бакета с именем длиной 32 символа:")
+        for key in root_files_to_delete:
+            print(key)
+    
+        # Удаляем их
+        if root_files_to_delete:
+            print(f"\nУдаляем {len(root_files_to_delete)} файл(ов)...")
+            s3_client = s3.credentials.get_s3_client()
+            for key in root_files_to_delete:
+                s3_client.delete_object(Bucket=s3.bucket_name, Key=key)
+            print("Удаление завершено.")
+        else:
+            print("Нет файлов, соответствующих условиям.")
+    
+    
+    def cleanup_temp_files():
+        for f in ["temp_left.wav", "temp_right.wav"]:
+            if os.path.exists(f):
+                os.remove(f)
+    
+    
+    def send_message(subject_text, message_text, recipients, attachment_path=None):
+        # отправка письма на почту
+            # Настройки почты
+        smtp_server = 'smtp.uralsib.ru'
+        smtp_port = 25
+        sender_email = 'dmas@uralsib.ru'
+                #recipient_email = ['VerbovaMA@uralsib.ru']
+                # Создаем объект сообщения
+        message = MIMEMultipart()
+        message['From'] = sender_email
+        message['To'] = recipients
+        message['Subject'] = subject_text
+            
+        body = message_text #(message_text, 'html', 'utf-8'))
+        message.attach(MIMEText(body, 'html'))
+    
+        # Если указан путь к файлу — добавляем вложение
+        if attachment_path and os.path.isfile(attachment_path):
+            with open(attachment_path, "rb") as attachment:
+                part = MIMEBase('application', 'octet-stream')
+                part.set_payload(attachment.read())
+            encoders.encode_base64(part)
+            part.add_header(
+                'Content-Disposition',
+                f'attachment; filename="{os.path.basename(attachment_path)}"'
+            )
+            message.attach(part)
+        
+        try:
+                    # Устанавливаем соединение с сервером
+            with smtplib.SMTP(smtp_server, smtp_port) as server:
+                server.sendmail(sender_email, recipients, message.as_string())
+                server.quit()
+                print("Письмо успешно отправлено!")
+        except Exception as e:
+            print(f"Произошла ошибка отправки письма: {e}")
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    # # Описание блока
+    # st.markdown(
+    #     """
+    #     <div style="border: 2px solid #8E00F7; border-radius: 5px; padding: 10px; padding-bottom: 10px; margin-bottom: 30px; background-color: #F8F8F8; width: 50%; margin-left: auto; margin-right: auto;">
+    #         <p style="font-size: 16px; color: #333; font-family: 'Arial'; text-align: center; margin: 0;">
+    #             Автоаналитика — сервис моментального построения профиля клиентов
+    #         </p>
+    #     </div>
+    #     """,
+    #     unsafe_allow_html=True
+    # )
+    
+    # Инициализация состояния
+    if "widget_load_state" not in st.session_state:
+        st.session_state.widget_load_state = 0
+    
+    
+    
+    # Блок загрузки файла 
+    st.markdown("### Загрузите файл")
+    uploaded_files = st.file_uploader(
+        f"Выберите файл с записью",
+        accept_multiple_files=True,
+        type=["wav"],
+        key="file_uploader1" + str(st.session_state.widget_load_state)
+    )
+    # Ограничение на 10 файлов
+    if uploaded_files:
+        if len(uploaded_files) > 10:
+            st.warning("Можно загрузить не более 10 файлов. Пожалуйста, выберите меньше файлов.")
+            uploaded_files = uploaded_files[:10]  # Опционально: работать только с первыми 10
+        else:
+            st.success(f"Загружено файлов: {len(uploaded_files)}")
+    
+    # После загрузки и сохранения файлов
+    total_duration = 0.0
+    if uploaded_files:
+        for uploaded_file in uploaded_files[:10]:
+            folder_path, filename = load_file(uploaded_file, uploaded_file.name)
+            file_path = os.path.join(folder_path, filename)
+            
+            # Получаем длительность БЕЗ перезаписи
+            try:
+                with AudioFileClip(file_path) as clip:
+                    total_duration += clip.duration
+            except Exception as e:
+                st.error(f"Не удалось прочитать {filename}: {e}")
+            cleanup_uploaded_file(folder_path, filename)
+        total_duration = round(total_duration / 2.8) + 10
+        m = total_duration // 60 
+        s = total_duration % 60
+        # st.markdown(f"## 🕒 Обработка займет примерно: {int(m)}мин. {int(s)}сек.")
+        st.markdown(
+            f"""
+            <div style="
+                border: 2px solid rgba(0, 0, 0, 0.4);
+                border-radius: 8px;
+                padding: 12px;
+                background-color: rgba(142, 0, 247, 0.08);
+                color: rgba(0, 0, 0, 0.4);
+                font-weight: bold;
+                text-align: center;
+                margin: 12px 0;
+                font-size: 16px;">
+                🕒 Обработка займет примерно: {int(m)} мин. {int(s)} сек.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    
+                
+    
+    
+        
+    
+    # Поле для ввода email (без проверок)
+    st.markdown("### Укажите получателя")
+    # user_input = st.text_input("Введите ваш email")
+    # 
+    
+    # df_email = load_data()
+    # corporate_emails = list(df_email.email)
+    # # Сортируем один раз по алфавиту
+    # EMAILS = sorted(corporate_emails)
+    
+    # selected = st.multiselect(
+    #     "Выберите email:",
+    #     options=EMAILS,
+    #     max_selections=1,
+    #     placeholder="Начните вводить email..."
+    # )
+    
+    # email = selected if selected else None
+    # st.write("Выбрано:", email)
+    
+    # Пример вашего датафрейма (замените на ваш реальный df)
+    df_email = load_data()
+    
+    # Шаг 1: Преобразуем DataFrame в словарь {fio: email}
+    people_dict = dict(zip(df_email["fio"], df_email["email"]))
+    
+    # Шаг 2: Формируем список для отображения в multiselect
+    display_options = [f"{fio} — {email}" for fio, email in people_dict.items()]
+    
+    # Шаг 3: Multiselect
+    selected_display = st.multiselect(
+        "Выберите сотрудников:",
+        options=display_options,
+        placeholder="Начните вводить ФИО или email..."
+    )
+    
+    # Шаг 4: Извлекаем email из выбранных строк
+    selected_emails = []
+    for item in selected_display:
+        # Разделяем строку по " — " и берём последнюю часть (email)
+        # Защита на случай, если в ФИО есть " — "
+        parts = item.split(" — ")
+        if len(parts) >= 2:
+            email = parts[-1]
+            selected_emails.append(email)
+        else:
+            # На всякий случай — если формат сломан
+            selected_emails.append(item)
+    
+    
+    # Блок 3 транскрибация
+    
+    def remove_folder(folder_path):
+        folder = Path(folder_path)
+        if folder.exists() and folder.is_dir():
+            shutil.rmtree(folder)
+            print(f"Папка удалена: {folder}")
+        else:
+            print(f"Папка не найдена или не является директорией: {folder}")
+            
+    def delete_file(filename: str):
+        file_path = Path(filename)  # относительный путь → текущая директория
+        if file_path.exists():
+            file_path.unlink()
+            
+    def transcripation(emails, uploaded_files):
+    
+        df = pd.DataFrame(columns=['file_name', 'dialogue'])
+    
+        files2transcrip = []
+        for uploaded_file in uploaded_files:
+            original_filename = uploaded_file.name
+            
+            folder_path, file_name = load_file(uploaded_file=uploaded_file, original_filename=original_filename)
+            # folder_path = 'audio_files/' + original_filename
+      
+    
+            file_decoding(folder_path)
+    
+            print(folder_path + '/' + file_name)
+            file_s3 = to_s3(folder_path + '/' + file_name)
+            cleanup_uploaded_file(folder_path, filename)
+            files2transcrip.append(file_s3)
+            
+    
+        run_deployment(
+            name="ifa-alg-audio-srv-transcrip-flow/ifa_alg_audio_srv_transcrip",  # имя flow/deployment
+            parameters={"audio_list": files2transcrip, 'user_id': st.session_state['session_uid']},
+            # timeout=120,  # секунд
+        )
+        s3 = S3Bucket.load("s3")
+        # Скачиваем файл
+        s3.download_object_to_path(from_path=f'srvdmas_transcrip/{st.session_state['session_uid']}.json', to_path=f'{st.session_state['session_uid']}.json')
+        with open(f'{st.session_state['session_uid']}.json', 'r', encoding='utf-8') as f:
+            result = json.load(f)
+
+
+        objects = s3.list_objects('srvdmas_transcrip')
+        for i in objects:
+            if i['Key'] == f'srvdmas_transcrip/{st.session_state['session_uid']}.json':
+                s3.credentials.get_s3_client().delete_object(Bucket='corporate', Key=i['Key']) 
+        
+        # result = flow_run.state.result()
+        # list_and_delete_root_files()
+        
+        
+        
+        for i in result:
+            all_turns = i['result']
+            name = i['name']
+            name = name.split('/')[-1]
+            
+            # Формируем одну строку диалога
+            dialog_lines = []
+            for turn in all_turns:
+                line = f"{turn['speaker']} - ({turn['start']:.1f}s – {turn['end']:.1f}s) - {turn['text']}"
+                dialog_lines.append(line)
+            full_dialogue = "\n".join(dialog_lines)
+            
+            # Создаём DataFrame
+            new_row = pd.DataFrame({
+                "file_name": [name],
+                "dialogue": [full_dialogue]
+            })
+    
+            df = pd.concat([df, new_row], ignore_index=True)
+    
+        # определяем время
+        now_utc = datetime.datetime.utcnow()  # или datetime.now(timezone.utc)
+        now_plus_3 = now_utc + timedelta(hours=3)
+        timestamp = now_plus_3.strftime("_%d_%m_%Y__%H_%M")
+        # Сохраняем DataFrame в Excel через openpyxl "вручную", чтобы контролировать формат
+        with pd.ExcelWriter(f"dialogues{timestamp}.xlsx", engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Dialogs")
+            worksheet = writer.sheets["Dialogs"]
+    
+            worksheet.column_dimensions['A'].width = 25
+            worksheet.column_dimensions['B'].width = 100   # dialogue
+            # Включаем перенос текста для всего столбца "dialogue" (столбец B = 2)
+            for row in worksheet.iter_rows(min_col=2, max_col=2):
+                for cell in row:
+                    cell.alignment = Alignment(wrap_text=True)
+    
+        for email in emails:
+            send_message('Сервис транскрибации', '', email, f"dialogues{timestamp}.xlsx")
+        delete_file(f"dialogues{timestamp}.xlsx")
+        remove_folder(folder_path)
+        
+    # Шаг 5. Кнопка запуска анализа
+    st.markdown("### Для запуска алгоритма нажмите")
+    if st.button("Пуск"):
+        if uploaded_files is None:
+            st.error("Ошибка: Пожалуйста, загрузите файл для транскрибации.")
+        elif len(selected_emails) == 0:
+            st.error("Ошибка: Пожалуйста, введите email для транскрибации.")
+        # elif reference_group == "Своя выборка" and reference_file is None:
+        #     st.error("Ошибка: Пожалуйста, загрузите файл с референтной группой.")
+        else:
+            transcripation(selected_emails,uploaded_files)
+            
+    
+
+        
