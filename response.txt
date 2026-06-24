@@ -1,0 +1,716 @@
+Да. Начать лучше с 2 ручек:
+
+1. `/dialogs/filter` — фильтрует таблицу и возвращает строки для Streamlit.
+2. `/dialogs/chart` — возвращает данные для графика, а сам график можно строить в Streamlit.
+
+В твоей Streamlit-странице сейчас фильтры собираются в `current_filters`, потом вызывается `apply_filters_logic(full_df, current_filters)`, а SQL-фильтр накладывается отдельно через `apply_sql_dialog_filter` . Это и переносим в FastAPI.
+
+## 1. Структура
+
+```text
+app/
+├── main.py
+├── state.py
+├── schemas.py
+├── services/
+│   ├── filters.py
+│   └── charts.py
+└── routers/
+    └── dialogs.py
+```
+
+## 2. `state.py` — глобальный датафрейм
+
+```python
+# app/state.py
+from io import BytesIO
+
+import polars as pl
+from prefect_aws.s3 import S3Bucket
+
+
+FULL_DF: pl.DataFrame | None = None
+
+
+def load_data_from_s3(prefix: str = "ifa/audio_serv") -> pl.DataFrame:
+    s3 = S3Bucket.load("s3")
+    filename = "audio_base.parquet"
+    raw = s3.read_path(f"{prefix}/{filename}")
+
+    df = pl.read_parquet(BytesIO(raw))
+    df = df.rename({col: col.lower() for col in df.columns})
+
+    return df
+
+
+def init_global_df() -> None:
+    global FULL_DF
+    FULL_DF = load_data_from_s3()
+
+
+def get_full_df() -> pl.DataFrame:
+    if FULL_DF is None:
+        raise RuntimeError("DataFrame ещё не загружен")
+    return FULL_DF
+```
+
+## 3. `schemas.py` — входные фильтры
+
+```python
+# app/schemas.py
+from datetime import date
+from pydantic import BaseModel, Field
+
+
+class DialogFilters(BaseModel):
+    audio: list[str] = Field(default_factory=list)
+    phone: list[str] = Field(default_factory=list)
+    client: list[str] = Field(default_factory=list)
+    direction: list[str] = Field(default_factory=list)
+    manager: list[str] = Field(default_factory=list)
+    contact_id: list[str] = Field(default_factory=list)
+
+    date_actual: tuple[date, date]
+
+    extra: list[str] = Field(default_factory=list)
+
+    search: str = ""
+    search_mode_toggle: bool = False
+    search_type_codes: list[int] = Field(default_factory=list)
+
+    theme_1_1: list[str] = Field(default_factory=list)
+    theme_1_2: list[str] = Field(default_factory=list)
+
+    polite_employee_include: bool = True
+
+    name_asked: str = "Любой"
+    name_provided: str = "Любой"
+    name_used: str = "Любой"
+    name_used_3plus: str = "Любой"
+
+    sql_condition: str | None = None
+
+
+class FilterResponse(BaseModel):
+    total: int
+    rows: list[dict]
+    visible_chat_ids: list[str]
+
+
+class ChartRequest(BaseModel):
+    visible_chat_ids: list[str]
+    date_actual: tuple[date, date]
+
+
+class ChartResponse(BaseModel):
+    points: list[dict]
+```
+
+## 4. `services/filters.py`
+
+Сюда переносишь твои функции: `safe_search_mask`, `filter_dialog_by_type_codes`, `fuzzy_trigram_match`, `apply_sql_dialog_filter`, `apply_filters_logic`. Важно: убрать всё `st.error`, `st.warning`, потому что в FastAPI нет Streamlit.
+
+Пример адаптированной части:
+
+```python
+# app/services/filters.py
+from datetime import date
+import re
+
+import duckdb
+import polars as pl
+
+
+def get_trigrams(s: str) -> set[str]:
+    s = " " + s.strip().lower() + " "
+    return {s[i:i + 3] for i in range(len(s) - 2)}
+
+
+def jaccard_similarity(set1: set[str], set2: set[str]) -> float:
+    if not set1 and not set2:
+        return 1.0
+    return len(set1 & set2) / len(set1 | set2)
+
+
+def fuzzy_trigram_match(text_series: pl.Series, query_word: str, threshold: float = 0.3) -> pl.Series:
+    query_trigrams = get_trigrams(query_word)
+
+    def match_cell(cell_value) -> bool:
+        if cell_value is None:
+            return False
+
+        words = str(cell_value).split()
+        for word in words:
+            if jaccard_similarity(query_trigrams, get_trigrams(word)) >= threshold:
+                return True
+
+        return False
+
+    return text_series.map_elements(match_cell, return_dtype=pl.Boolean)
+
+
+def safe_search_mask(series: pl.Series, search_text: str) -> pl.Series:
+    if not search_text or not search_text.strip():
+        return pl.Series([True] * len(series))
+
+    expr = search_text.strip().lower()
+
+    try:
+        groups = {}
+
+        def replace_group(match):
+            gid = f"__G{len(groups)}__"
+            groups[gid] = match.group(1).lower()
+            return gid
+
+        expr_proc = re.sub(r"\(([^)]+)\)", replace_group, expr)
+        expr_proc = expr_proc.replace(" и ", " & ").replace(" или ", " | ")
+
+        for gid, subexpr in groups.items():
+            subexpr = subexpr.replace(" и ", " & ").replace(" или ", " | ")
+            expr_proc = expr_proc.replace(gid, f"({subexpr})")
+
+        atoms = [a.strip() for a in re.findall(r"[^&|()]+", expr_proc) if a.strip()]
+        atoms = list(dict.fromkeys(atoms))
+
+        local_vars = {}
+
+        for i, atom in enumerate(atoms):
+            var_name = f"term_{i}"
+            phrase = atom.replace("&", "").replace("|", "").strip()
+
+            if phrase:
+                local_vars[var_name] = (
+                    series
+                    .str.contains(f"(?i){re.escape(phrase)}", literal=False)
+                    .fill_null(False)
+                )
+            else:
+                local_vars[var_name] = pl.Series([True] * len(series))
+
+            expr_proc = expr_proc.replace(atom, var_name)
+
+        mask = eval(expr_proc, {"__builtins__": {}}, local_vars)
+
+        return mask if isinstance(mask, pl.Series) else pl.Series([bool(mask)] * len(series))
+
+    except Exception:
+        words = expr.split()
+        mask = pl.Series([True] * len(series))
+
+        for word in words:
+            mask &= (
+                series
+                .str.contains(f"(?i){re.escape(word)}", literal=False)
+                .fill_null(False)
+            )
+
+        return mask
+
+
+def filter_dialog_by_type_codes(dialog: str, type_codes: list[int]) -> str:
+    if not dialog or not isinstance(dialog, str):
+        return ""
+
+    code_to_letter = {
+        0: "K",
+        1: "C",
+    }
+
+    target_letters = {
+        code_to_letter[c]
+        for c in type_codes
+        if c in code_to_letter
+    }
+
+    if not target_letters:
+        return ""
+
+    pattern = r"([CK])\s*-\s*\([^)]+\)\s*-\s*(.*?)(?=\n?[CK]\s*-\s*\(|$)"
+
+    filtered_parts = []
+
+    for match in re.finditer(pattern, dialog, re.DOTALL):
+        speaker = match.group(1)
+        full_msg = match.group(0).strip()
+
+        if speaker in target_letters:
+            filtered_parts.append(full_msg)
+
+    return "\n".join(filtered_parts)
+
+
+def apply_sql_dialog_filter(df: pl.DataFrame, sql_where: str) -> pl.DataFrame:
+    if not sql_where or not sql_where.strip():
+        return df
+
+    con = duckdb.connect()
+    con.register("transcripts", df)
+
+    sql_clean = sql_where.strip()
+
+    if sql_clean.upper().startswith("SELECT"):
+        query = sql_clean
+    else:
+        query = f"SELECT * FROM transcripts WHERE {sql_clean}"
+
+    return con.execute(query).pl()
+```
+
+## 5. Основная фильтрация
+
+```python
+def apply_filters_logic(full_df: pl.DataFrame, filters: dict) -> pl.DataFrame:
+    filtered_df = full_df.clone()
+
+    start_date, end_date = filters["date_actual"]
+
+    if not isinstance(start_date, date):
+        start_date = start_date.date()
+
+    if not isinstance(end_date, date):
+        end_date = end_date.date()
+
+    filtered_df = filtered_df.filter(
+        (pl.col("ddate").dt.date() >= start_date)
+        & (pl.col("ddate").dt.date() <= end_date)
+    )
+
+    if filters.get("audio"):
+        filtered_df = filtered_df.filter(
+            pl.col("id").cast(pl.Utf8).is_in(filters["audio"])
+        )
+
+    if filters.get("phone"):
+        filtered_df = filtered_df.filter(
+            pl.col("phone").cast(pl.Utf8).is_in(filters["phone"])
+        )
+
+    if filters.get("client"):
+        filtered_df = filtered_df.filter(
+            pl.col("inn").cast(pl.Utf8).is_in(filters["client"])
+        )
+
+    if filters.get("direction"):
+        filtered_df = filtered_df.filter(
+            pl.col("direction").cast(pl.Utf8).is_in(filters["direction"])
+        )
+
+    if filters.get("manager"):
+        conditions = [
+            pl.col("employeename").str.contains(name, literal=True)
+            for name in filters["manager"]
+        ]
+        filtered_df = filtered_df.filter(pl.any_horizontal(conditions))
+
+    if filters.get("contact_id"):
+        filtered_df = filtered_df.filter(
+            pl.col("contact_id").cast(pl.Utf8).is_in(filters["contact_id"])
+        )
+
+    chat_ids_to_keep = set(
+        filtered_df
+        .select("id")
+        .to_series()
+        .to_list()
+    )
+
+    extra = filters.get("extra", [])
+
+    if "Диалог с эмоциональной окраской со стороны клиента" in extra:
+        emotional_ids = set(
+            filtered_df
+            .filter(pl.col("has_emotion") == 1)
+            .select("id")
+            .unique()
+            .to_series()
+            .to_list()
+        )
+        chat_ids_to_keep &= emotional_ids
+
+    if "Тематика обращений 1.1" in extra:
+        theme_ids = set(
+            filtered_df
+            .filter(pl.col("theme_1_1").is_in(filters.get("theme_1_1", [])))
+            .select("id")
+            .unique()
+            .to_series()
+            .to_list()
+        )
+        chat_ids_to_keep &= theme_ids
+
+    if "Тематика обращений 1.2" in extra:
+        theme_ids = set(
+            filtered_df
+            .filter(pl.col("theme_1_2").is_in(filters.get("theme_1_2", [])))
+            .select("id")
+            .unique()
+            .to_series()
+            .to_list()
+        )
+        chat_ids_to_keep &= theme_ids
+
+    if "Вежливость со стороны сотрудника" in extra:
+        polite_ids = set(
+            filtered_df
+            .filter(pl.col("employee_politeness") == True)
+            .select("id")
+            .unique()
+            .to_series()
+            .to_list()
+        )
+
+        if filters.get("polite_employee_include", True):
+            chat_ids_to_keep &= polite_ids
+        else:
+            chat_ids_to_keep -= polite_ids
+
+    if "Обращение по имени" in extra:
+        bool_filters = {
+            "name_asked": "is_name_asked",
+            "name_provided": "is_name_provided",
+            "name_used": "is_name_used",
+            "name_used_3plus": "is_name_used_3plus",
+        }
+
+        for filter_key, col_name in bool_filters.items():
+            value = filters.get(filter_key, "Любой")
+
+            if value == "Любой":
+                continue
+
+            target = value == "Да"
+
+            ids = set(
+                filtered_df
+                .filter(
+                    pl.col(col_name)
+                    .fill_null(False)
+                    .cast(pl.Boolean)
+                    == target
+                )
+                .select("id")
+                .unique()
+                .to_series()
+                .to_list()
+            )
+
+            chat_ids_to_keep &= ids
+
+    filtered_df = filtered_df.filter(pl.col("id").is_in(chat_ids_to_keep))
+
+    search_words = filters.get("search", "")
+
+    if search_words.strip():
+        if not filters.get("search_mode_toggle", False):
+            words = [w.strip() for w in search_words.split() if w]
+            combined_mask = pl.Series([False] * len(filtered_df))
+
+            for word in words:
+                word_mask = fuzzy_trigram_match(
+                    filtered_df["dialog"].fill_null("").cast(pl.String),
+                    word,
+                    threshold=0.3,
+                )
+                combined_mask |= word_mask
+
+            chat_ids_with_match = filtered_df.filter(combined_mask)["id"].unique()
+            filtered_df = filtered_df.filter(pl.col("id").is_in(chat_ids_with_match))
+
+        else:
+            type_codes = filters.get("search_type_codes", [])
+
+            if type_codes:
+                filtered_dialogs = (
+                    filtered_df["dialog"]
+                    .fill_null("")
+                    .cast(pl.String)
+                    .map_elements(
+                        lambda d: filter_dialog_by_type_codes(d, type_codes),
+                        return_dtype=pl.String,
+                    )
+                )
+
+                mask = safe_search_mask(filtered_dialogs, search_words)
+                matching_chats = filtered_df.filter(mask)["id"].unique()
+
+                filtered_df = filtered_df.filter(pl.col("id").is_in(matching_chats))
+            else:
+                filtered_df = filtered_df.slice(0, 0)
+
+    if filters.get("sql_condition"):
+        filtered_df = apply_sql_dialog_filter(filtered_df, filters["sql_condition"])
+
+    return filtered_df
+```
+
+В твоей версии `apply_filters_logic` в конце возвращает и датафрейм, и `final_visible_audios` — список пар `(id, dialog)` . В FastAPI удобнее возвращать только `DataFrame`, а уже в ручке формировать JSON.
+
+## 6. Подготовка строк таблицы
+
+```python
+def make_summary_rows(filtered_df: pl.DataFrame) -> list[dict]:
+    rows = []
+
+    if filtered_df.is_empty():
+        return rows
+
+    unique_df = filtered_df.unique(subset=["id"], keep="first")
+
+    for row in unique_df.to_dicts():
+        inn = row.get("inn")
+
+        rows.append({
+            "date": row["ddate"].strftime("%Y-%m-%d") if row.get("ddate") else None,
+            "time": row.get("time_start"),
+            "dialog_id": str(row.get("id")),
+            "employee_name": str(row.get("employeename") or ""),
+            "dialog": str(row.get("dialog") or ""),
+            "duration": str(row.get("min_duration") or ""),
+            "inn": inn or "",
+            "advisor_url": f"https://bk/Info/Articles/Page.asp?ID=78937&inn={inn}" if inn else "",
+            "in_lfb": row.get("in_lfb"),
+            "phone": row.get("phone"),
+            "contact_id": row.get("contact_id"),
+            "direction": row.get("direction"),
+            "theme_1_1": row.get("theme_1_1") or "",
+            "theme_1_2": row.get("theme_1_2") or "",
+            "employee_politeness": "Да" if row.get("employee_politeness") else "Нет",
+        })
+
+    return rows
+```
+
+## 7. `services/charts.py`
+
+В Streamlit сейчас `build_chart` строит `plotly.Figure`, но для FastAPI лучше возвращать данные графика: `week`, `count`, `total_count`, `share`. А Streamlit уже сам построит `plotly` .
+
+```python
+# app/services/charts.py
+from datetime import date
+
+import polars as pl
+import pandas as pd
+
+
+def build_chart_data(
+    df: pl.DataFrame,
+    visible_chat_ids: list[str],
+    date_range: tuple[date, date],
+) -> list[dict]:
+    pdf = df.to_pandas()
+
+    start_date, end_date = date_range
+
+    pdf = pdf[
+        (pdf["ddate"].dt.date >= start_date)
+        & (pdf["ddate"].dt.date <= end_date)
+    ].copy()
+
+    visible_df = pdf[pdf["id"].astype(str).isin(visible_chat_ids)].copy()
+    all_df = pdf.copy()
+
+    visible_df["week"] = pd.to_datetime(visible_df["ddate"]).dt.to_period("W-SUN").astype(str)
+    all_df["week"] = pd.to_datetime(all_df["ddate"]).dt.to_period("W-SUN").astype(str)
+
+    weekly_visible = visible_df.groupby("week")["id"].nunique()
+    weekly_all = all_df.groupby("week")["id"].nunique()
+
+    date_series = pd.date_range(start=start_date, end=end_date, freq="D")
+    all_weeks = pd.Series(date_series).dt.to_period("W-SUN").astype(str).unique()
+
+    weekly_visible = weekly_visible.reindex(all_weeks, fill_value=0)
+    weekly_all = weekly_all.reindex(all_weeks, fill_value=0)
+
+    result = []
+
+    for week, count, total_count in zip(
+        all_weeks,
+        weekly_visible.values,
+        weekly_all.values,
+    ):
+        share = round((count / total_count) * 100, 2) if total_count > 0 else 0
+        week_number = pd.Period(week).start_time.isocalendar()[1]
+
+        result.append({
+            "week": week,
+            "week_label": f"Неделя {week_number}",
+            "count": int(count),
+            "total_count": int(total_count),
+            "share": float(share),
+        })
+
+    return result
+```
+
+## 8. `routers/dialogs.py`
+
+```python
+# app/routers/dialogs.py
+from fastapi import APIRouter
+
+from app.schemas import DialogFilters, FilterResponse, ChartRequest, ChartResponse
+from app.state import get_full_df
+from app.services.filters import apply_filters_logic, make_summary_rows
+from app.services.charts import build_chart_data
+
+
+router = APIRouter(prefix="/dialogs", tags=["dialogs"])
+
+
+@router.post("/filter", response_model=FilterResponse)
+def filter_dialogs(filters: DialogFilters):
+    full_df = get_full_df()
+
+    filtered_df = apply_filters_logic(
+        full_df=full_df,
+        filters=filters.model_dump(),
+    )
+
+    rows = make_summary_rows(filtered_df)
+    visible_chat_ids = [str(row["dialog_id"]) for row in rows]
+
+    return {
+        "total": len(rows),
+        "rows": rows,
+        "visible_chat_ids": visible_chat_ids,
+    }
+
+
+@router.post("/chart", response_model=ChartResponse)
+def get_chart_data(payload: ChartRequest):
+    full_df = get_full_df()
+
+    points = build_chart_data(
+        df=full_df,
+        visible_chat_ids=payload.visible_chat_ids,
+        date_range=payload.date_actual,
+    )
+
+    return {
+        "points": points,
+    }
+```
+
+## 9. `main.py`
+
+```python
+# app/main.py
+from fastapi import FastAPI
+
+from app.state import init_global_df
+from app.routers.dialogs import router as dialogs_router
+
+
+app = FastAPI(title="Audio Service API")
+
+
+@app.on_event("startup")
+def startup():
+    init_global_df()
+
+
+app.include_router(dialogs_router)
+```
+
+## 10. Как Streamlit будет вызывать FastAPI
+
+```python
+import requests
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+
+API_URL = "http://127.0.0.1:8000"
+
+
+filters_payload = {
+    "audio": selected_audio,
+    "phone": selected_phone,
+    "client": selected_client,
+    "direction": selected_direction,
+    "manager": selected_manager,
+    "contact_id": selected_contact_id,
+    "date_actual": [
+        str(actual_date_range[0]),
+        str(actual_date_range[1]),
+    ],
+    "extra": selected_extra,
+    "search": search_words,
+    "search_mode_toggle": toggle_value,
+    "search_type_codes": selected_search_type_codes if toggle_value else [],
+    "theme_1_1": selected_theme_1_1,
+    "theme_1_2": selected_theme_1_2,
+    "polite_employee_include": st.session_state.polite_employee_include,
+    "name_asked": st.session_state.filters.get("name_asked", "Любой"),
+    "name_provided": st.session_state.filters.get("name_provided", "Любой"),
+    "name_used": st.session_state.filters.get("name_used", "Любой"),
+    "name_used_3plus": st.session_state.filters.get("name_used_3plus", "Любой"),
+    "sql_condition": sql_condition if sql_mode else None,
+}
+
+response = requests.post(
+    f"{API_URL}/dialogs/filter",
+    json=filters_payload,
+    timeout=60,
+)
+
+data = response.json()
+
+st.write(f"Найдено {data['total']} диалогов")
+
+summary_df = pd.DataFrame(data["rows"])
+st.dataframe(summary_df)
+```
+
+График:
+
+```python
+chart_response = requests.post(
+    f"{API_URL}/dialogs/chart",
+    json={
+        "visible_chat_ids": data["visible_chat_ids"],
+        "date_actual": [
+            str(actual_date_range[0]),
+            str(actual_date_range[1]),
+        ],
+    },
+    timeout=60,
+)
+
+chart_data = chart_response.json()["points"]
+chart_df = pd.DataFrame(chart_data)
+
+fig = go.Figure()
+
+fig.add_trace(go.Scatter(
+    x=chart_df["week_label"],
+    y=chart_df["count"],
+    name="Количество диалогов",
+    mode="lines+markers",
+))
+
+fig.add_trace(go.Scatter(
+    x=chart_df["week_label"],
+    y=chart_df["share"],
+    name="Доля от всех диалогов, %",
+    mode="lines+markers",
+    yaxis="y2",
+))
+
+fig.update_layout(
+    title="Динамика диалогов",
+    yaxis=dict(title="Количество диалогов"),
+    yaxis2=dict(
+        title="Доля, %",
+        overlaying="y",
+        side="right",
+        range=[0, 100],
+    ),
+)
+
+st.plotly_chart(fig, use_container_width=True)
+```
+
+Главная идея: **Streamlit больше не фильтрует `full_df` сам**. Он только собирает значения из виджетов, отправляет JSON в FastAPI, получает готовые строки таблицы и данные графика.
