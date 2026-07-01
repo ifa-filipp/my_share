@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srvdmas-api
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: srvdmas-api
+  template:
+    metadata:
+      labels:
+        app: srvdmas-api
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: srvdmas-api
+          image: nexus.fc.uralsibbank.ru/ml-platform/srvdmas-api:1
+          imagePullPolicy: Always
+          # securityContext:
+          #   runAsUser: 1000
+          #   runAsGroup: 1000
+          ports:
+            - containerPort: 8000
+          # env:
+          # - name: API_KEY
+          #   valueFrom:
+          #     secretKeyRef:
+          #       name: document-separation-api-key
+          #       key: api_key
+          resources:
+            limits:
+              cpu: 8
+              memory: 40Gi
+            requests:
+              cpu: 500m
+              memory: 2Gi
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 60
+            timeoutSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 500Mi
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: srvdmas-api
+spec:
+  selector:
+    app: srvdmas-api
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: ClusterIP
+---
+
+ kind: Ingress
+ apiVersion: networking.k8s.io/v1
+ metadata:
+   name: srvdmas-api
+   annotations:
+     nginx.ingress.kubernetes.io/websocket-services: "gpt"
+     nginx.ingress.kubernetes.io/proxy-connect-timeout: "600"
+     nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+     nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+     nginx.ingress.kubernetes.io/proxy-body-size: "0"
+ spec:
+   ingressClassName: nginx
+   rules:
+     - host: srvdmas-api.run.fc.uralsibbank.ru
+       http:
+         paths:
+           - path: /
+             pathType: ImplementationSpecific
+             backend:
+               service:
+                 name: srvdmas-api
+                 port:
+                   number: 80
+---
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: srvdmas-api-api-key
+#   namespace: ais
+# type: Opaque
+# stringData:
+#   # Required — must be overridden with an api.run access key sk-bf-*
+#   api_key: "CHANGE_ME"
+
